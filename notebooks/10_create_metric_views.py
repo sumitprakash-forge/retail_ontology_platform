@@ -231,6 +231,131 @@ print("Metric view 7 created: ontology_coverage")
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ## Metric View 8: keto_households
+# MAGIC Count of active KetoDieter households (keto_basket_share > 0.35). PDF spec KPM.
+
+# COMMAND ----------
+
+spark.sql("""
+CREATE OR REPLACE VIEW v2_ontology.metrics.keto_households AS
+SELECT
+  COUNT(*) AS keto_household_count,
+  SUM(CASE WHEN lifecycle_stage = 'ActiveKetoDieter' THEN 1 ELSE 0 END) AS active_keto_count,
+  SUM(CASE WHEN lifecycle_stage = 'CasualKetoDieter' THEN 1 ELSE 0 END) AS casual_keto_count,
+  SUM(CASE WHEN lifecycle_stage = 'LapsedKetoDieter' THEN 1 ELSE 0 END) AS lapsed_keto_count,
+  AVG(keto_basket_share) AS avg_keto_basket_share,
+  SUM(keto_spend) AS total_keto_spend
+FROM v2_ontology.abstractions.kpm_audiences
+""")
+print("Metric view 8 created: keto_households")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Metric View 9: net_revenue
+# MAGIC Net revenue = gross revenue minus discounts. PDF spec KPM.
+
+# COMMAND ----------
+
+spark.sql("""
+CREATE OR REPLACE VIEW v2_ontology.metrics.net_revenue AS
+SELECT
+  CAST(transaction_ts AS DATE) AS transaction_date,
+  SUM(quantity * unit_price) AS gross_revenue,
+  SUM(COALESCE(discount_amt, 0)) AS total_discounts,
+  SUM(quantity * unit_price) - SUM(COALESCE(discount_amt, 0)) AS net_revenue,
+  SUM(quantity * unit_cost) AS total_cost,
+  SUM(quantity * unit_price) - SUM(quantity * unit_cost) AS gross_margin,
+  (SUM(quantity * unit_price) - SUM(quantity * unit_cost))
+    / NULLIF(SUM(quantity * unit_price), 0) AS gross_margin_pct
+FROM v2_raw.transactions.pos_transactions
+GROUP BY CAST(transaction_ts AS DATE)
+""")
+print("Metric view 9 created: net_revenue")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Metric View 10: digital_penetration
+# MAGIC Digital vs in-store transaction share. PDF spec KPM.
+
+# COMMAND ----------
+
+spark.sql("""
+CREATE OR REPLACE VIEW v2_ontology.metrics.digital_penetration AS
+SELECT
+  CAST(transaction_ts AS DATE) AS transaction_date,
+  COUNT(*) AS total_transactions,
+  SUM(CASE WHEN channel IN ('ONLINE', 'DIGITAL', 'APP', 'WEB') THEN 1 ELSE 0 END)
+    AS digital_transactions,
+  SUM(CASE WHEN channel IN ('ONLINE', 'DIGITAL', 'APP', 'WEB') THEN 1 ELSE 0 END)
+    * 100.0 / NULLIF(COUNT(*), 0) AS digital_pct,
+  SUM(CASE WHEN channel IN ('ONLINE', 'DIGITAL', 'APP', 'WEB') THEN quantity * unit_price ELSE 0 END)
+    AS digital_revenue,
+  SUM(quantity * unit_price) AS total_revenue,
+  SUM(CASE WHEN channel IN ('ONLINE', 'DIGITAL', 'APP', 'WEB') THEN quantity * unit_price ELSE 0 END)
+    * 100.0 / NULLIF(SUM(quantity * unit_price), 0) AS digital_revenue_pct
+FROM v2_raw.transactions.pos_transactions
+GROUP BY CAST(transaction_ts AS DATE)
+""")
+print("Metric view 10 created: digital_penetration")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Metric View 11: avg_basket_size
+# MAGIC Average basket size (units and value) per channel and store. PDF spec KPM.
+
+# COMMAND ----------
+
+spark.sql("""
+CREATE OR REPLACE VIEW v2_ontology.metrics.avg_basket_size AS
+SELECT
+  store_id,
+  channel,
+  COUNT(DISTINCT transaction_id) AS basket_count,
+  SUM(quantity) / NULLIF(COUNT(DISTINCT transaction_id), 0) AS avg_units_per_basket,
+  SUM(quantity * unit_price) / NULLIF(COUNT(DISTINCT transaction_id), 0) AS avg_basket_value,
+  AVG(quantity * unit_price) AS avg_line_item_value
+FROM v2_raw.transactions.pos_transactions
+GROUP BY store_id, channel
+""")
+print("Metric view 11 created: avg_basket_size")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Metric View 12: at_risk_value
+# MAGIC Revenue at-risk from churning households (atrisk_customer_radar × historical spend).
+
+# COMMAND ----------
+
+spark.sql("""
+CREATE OR REPLACE VIEW v2_ontology.metrics.at_risk_value AS
+WITH hh_spend AS (
+  SELECT
+    household_id,
+    SUM(quantity * unit_price) AS total_spend_90d
+  FROM v2_raw.transactions.pos_transactions
+  WHERE household_id IS NOT NULL
+    AND transaction_ts >= CURRENT_TIMESTAMP() - INTERVAL 90 DAYS
+  GROUP BY household_id
+)
+SELECT
+  ar.churn_risk_score,
+  ar.loyalty_tier,
+  COUNT(*) AS household_count,
+  SUM(COALESCE(hs.total_spend_90d, 0)) AS total_at_risk_spend_90d,
+  AVG(COALESCE(hs.total_spend_90d, 0)) AS avg_at_risk_spend_per_household
+FROM v2_ontology.abstractions.atrisk_customer_radar ar
+LEFT JOIN hh_spend hs ON ar.household_id = hs.household_id
+GROUP BY ar.churn_risk_score, ar.loyalty_tier
+""")
+print("Metric view 12 created: at_risk_value")
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ## Create validation_results Table (Delta)
 
 # COMMAND ----------
@@ -259,7 +384,9 @@ print("\n=== Metric Views Verification ===")
 metric_views = [
     "daily_sales_performance", "inventory_health", "customer_lifecycle",
     "dietary_cohort_performance", "substitution_impact",
-    "pharmacy_crosssell_metrics", "ontology_coverage"
+    "pharmacy_crosssell_metrics", "ontology_coverage",
+    "keto_households", "net_revenue", "digital_penetration",
+    "avg_basket_size", "at_risk_value"
 ]
 for v in metric_views:
     try:

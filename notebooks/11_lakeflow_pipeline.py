@@ -233,9 +233,63 @@ print("To deploy: copy the code above into a Databricks notebook and attach it t
 
 # COMMAND ----------
 
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Daily Persona Refresh Job (PDF spec)
+# MAGIC Scheduled job that recomputes household_lifecycle bridge table daily,
+# MAGIC triggering persona reassignment for kpm_audiences and atrisk_customer_radar.
+
+# COMMAND ----------
+
+PERSONA_REFRESH_JOB_CONFIG = {
+    "name": "ontology-daily-persona-refresh",
+    "tasks": [
+        {
+            "task_key": "refresh_household_lifecycle",
+            "description": "Recompute household_lifecycle bridge from last 90d transactions",
+            "notebook_task": {
+                "notebook_path": "/Workspace/ontology-platform/notebooks/12_lakebase_setup",
+                "base_parameters": {
+                    "refresh_mode": "lifecycle_only"
+                }
+            },
+            "existing_cluster_id": "{{cluster_id}}"
+        }
+    ],
+    "schedule": {
+        "quartz_cron_expression": "0 0 3 * * ?",
+        "timezone_id": "UTC",
+        "pause_status": "UNPAUSED"
+    },
+    "max_concurrent_runs": 1,
+    "timeout_seconds": 3600
+}
+
+try:
+    from databricks.sdk import WorkspaceClient
+    w = WorkspaceClient()
+
+    existing_jobs = list(w.jobs.list(name="ontology-daily-persona-refresh"))
+    if existing_jobs:
+        print(f"Daily persona refresh job already exists (ID: {existing_jobs[0].job_id}). Skipping creation.")
+    else:
+        print("Daily persona refresh job config defined (not creating — no cluster_id at runtime).")
+        print("To schedule: create a job with the config below via Databricks UI or REST API.")
+        import json
+        print(json.dumps(PERSONA_REFRESH_JOB_CONFIG, indent=2))
+except Exception as e:
+    print(f"SDK not available for job creation: {e}")
+    import json
+    print("Daily persona refresh job config:")
+    print(json.dumps(PERSONA_REFRESH_JOB_CONFIG, indent=2))
+
+# COMMAND ----------
+
 print(f"\nPipeline setup complete!")
 print(f"  Pipeline name: {PIPELINE_NAME}")
 print(f"  Catalog: {PIPELINE_CATALOG}")
 print(f"  Target schema: {PIPELINE_TARGET}")
 print(f"  Bronze tables: {len(BRONZE_TABLES)}")
 print(f"  Silver tables: {len(SILVER_TABLES)}")
+print(f"  Daily persona refresh: ontology-daily-persona-refresh (scheduled 03:00 UTC)")

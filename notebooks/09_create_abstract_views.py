@@ -149,7 +149,7 @@ print("View 4 created: v2_ontology.abstractions.retail_media_audiences")
 
 # MAGIC %md
 # MAGIC ## View 5: margin_aware_substitution
-# MAGIC Substitution graph enriched with pricing and margin delta.
+# MAGIC Substitution graph enriched with dietary_fit_score × margin multiplier (PDF spec).
 
 # COMMAND ----------
 
@@ -165,10 +165,43 @@ SELECT
   sg.is_dietary_safe,
   src_sku.avg_retail_price AS source_price,
   tgt_sku.avg_retail_price AS target_price,
-  COALESCE(tgt_sku.avg_retail_price, 0) - COALESCE(src_sku.avg_retail_price, 0) AS margin_delta
+  COALESCE(tgt_sku.avg_retail_price, 0) - COALESCE(src_sku.avg_retail_price, 0) AS margin_delta,
+  -- dietary_fit_score: 1.0 if same keto/vegan/gf flags; 0.5 if partial; 0.0 if conflict
+  CASE
+    WHEN COALESCE(tc.is_keto_compliant, FALSE) = COALESCE(sc.is_keto_compliant, FALSE)
+     AND COALESCE(tc.is_vegan, FALSE) = COALESCE(sc.is_vegan, FALSE)
+     AND COALESCE(tc.is_gluten_free, FALSE) = COALESCE(sc.is_gluten_free, FALSE)
+    THEN 1.0
+    WHEN COALESCE(tc.is_keto_compliant, FALSE) = COALESCE(sc.is_keto_compliant, FALSE)
+    THEN 0.5
+    ELSE 0.0
+  END AS dietary_fit_score,
+  -- margin_multiplier: ratio of target to source price (how much margin gain per unit)
+  CASE
+    WHEN COALESCE(src_sku.avg_retail_price, 0) > 0
+    THEN COALESCE(tgt_sku.avg_retail_price, src_sku.avg_retail_price) / src_sku.avg_retail_price
+    ELSE 1.0
+  END AS margin_multiplier,
+  -- composite_score: dietary_fit × margin_multiplier × similarity_score (PDF spec formula)
+  CASE
+    WHEN COALESCE(src_sku.avg_retail_price, 0) > 0
+      AND COALESCE(tc.is_keto_compliant, FALSE) = COALESCE(sc.is_keto_compliant, FALSE)
+      AND COALESCE(tc.is_vegan, FALSE) = COALESCE(sc.is_vegan, FALSE)
+      AND COALESCE(tc.is_gluten_free, FALSE) = COALESCE(sc.is_gluten_free, FALSE)
+    THEN sg.similarity_score
+        * 1.0
+        * (COALESCE(tgt_sku.avg_retail_price, src_sku.avg_retail_price) / src_sku.avg_retail_price)
+    WHEN COALESCE(src_sku.avg_retail_price, 0) > 0
+    THEN sg.similarity_score
+        * 0.5
+        * (COALESCE(tgt_sku.avg_retail_price, src_sku.avg_retail_price) / src_sku.avg_retail_price)
+    ELSE sg.similarity_score * 0.5
+  END AS composite_score
 FROM v2_ontology.abstractions.substitution_graph sg
 JOIN v2_raw.products.sku_master src_sku ON sg.source_upc = src_sku.upc
 JOIN v2_raw.products.sku_master tgt_sku ON sg.target_upc = tgt_sku.upc
+LEFT JOIN v2_ontology.bridge.sku_classifications sc ON sg.source_upc = sc.upc
+LEFT JOIN v2_ontology.bridge.sku_classifications tc ON sg.target_upc = tc.upc
 """)
 print("View 5 created: v2_ontology.abstractions.margin_aware_substitution")
 
@@ -203,16 +236,37 @@ print("View 6 created: v2_ontology.abstractions.pharmacy_grocery_crosssell")
 
 # MAGIC %md
 # MAGIC ## View 7: atrisk_customer_radar
-# MAGIC Active customers with low transaction frequency indicating churn risk.
+# MAGIC Detects trip frequency drop: current 30d trips vs prior 30d trips (PDF spec).
 
 # COMMAND ----------
 
 spark.sql("""
 CREATE OR REPLACE VIEW v2_ontology.abstractions.atrisk_customer_radar AS
-WITH txn_counts AS (
+WITH recent_trips AS (
   SELECT
     household_id,
-    COUNT(*) AS transaction_count,
+    COUNT(*) AS trips_last_30d,
+    SUM(quantity * unit_price) AS spend_last_30d
+  FROM v2_raw.transactions.pos_transactions
+  WHERE household_id IS NOT NULL
+    AND transaction_ts >= CURRENT_TIMESTAMP() - INTERVAL 30 DAYS
+  GROUP BY household_id
+),
+prior_trips AS (
+  SELECT
+    household_id,
+    COUNT(*) AS trips_prior_30d,
+    SUM(quantity * unit_price) AS spend_prior_30d
+  FROM v2_raw.transactions.pos_transactions
+  WHERE household_id IS NOT NULL
+    AND transaction_ts >= CURRENT_TIMESTAMP() - INTERVAL 60 DAYS
+    AND transaction_ts <  CURRENT_TIMESTAMP() - INTERVAL 30 DAYS
+  GROUP BY household_id
+),
+all_trips AS (
+  SELECT
+    household_id,
+    COUNT(*) AS total_trips,
     MAX(transaction_ts) AS last_transaction_ts
   FROM v2_raw.transactions.pos_transactions
   WHERE household_id IS NOT NULL
@@ -223,15 +277,114 @@ SELECT
   hp.loyalty_tier,
   hp.is_active,
   hp.store_id_primary,
-  COALESCE(tc.transaction_count, 0) AS transaction_count,
-  tc.last_transaction_ts,
-  DATEDIFF(CURRENT_DATE(), CAST(tc.last_transaction_ts AS DATE)) AS days_since_last_purchase
+  COALESCE(at.total_trips, 0) AS total_trips,
+  at.last_transaction_ts,
+  DATEDIFF(CURRENT_DATE(), CAST(at.last_transaction_ts AS DATE)) AS days_since_last_purchase,
+  COALESCE(rt.trips_last_30d, 0) AS trips_last_30d,
+  COALESCE(pt.trips_prior_30d, 0) AS trips_prior_30d,
+  COALESCE(rt.spend_last_30d, 0) AS spend_last_30d,
+  COALESCE(pt.spend_prior_30d, 0) AS spend_prior_30d,
+  -- trip_frequency_drop: pct drop in trips from prior to current 30d window
+  CASE
+    WHEN COALESCE(pt.trips_prior_30d, 0) > 0
+    THEN ROUND((pt.trips_prior_30d - COALESCE(rt.trips_last_30d, 0)) * 100.0 / pt.trips_prior_30d, 1)
+    ELSE NULL
+  END AS trip_frequency_drop_pct,
+  -- churn_risk_score: composite based on days inactive + trip drop
+  CASE
+    WHEN COALESCE(at.total_trips, 0) = 0 THEN 'HIGH'
+    WHEN DATEDIFF(CURRENT_DATE(), CAST(at.last_transaction_ts AS DATE)) > 45 THEN 'HIGH'
+    WHEN COALESCE(pt.trips_prior_30d, 0) > 0
+     AND COALESCE(rt.trips_last_30d, 0) < pt.trips_prior_30d * 0.5 THEN 'HIGH'
+    WHEN DATEDIFF(CURRENT_DATE(), CAST(at.last_transaction_ts AS DATE)) > 21 THEN 'MEDIUM'
+    WHEN COALESCE(pt.trips_prior_30d, 0) > 0
+     AND COALESCE(rt.trips_last_30d, 0) < pt.trips_prior_30d * 0.75 THEN 'MEDIUM'
+    ELSE 'LOW'
+  END AS churn_risk_score
 FROM v2_raw.customers.household_profiles hp
-LEFT JOIN txn_counts tc ON hp.household_id = tc.household_id
+LEFT JOIN all_trips at ON hp.household_id = at.household_id
+LEFT JOIN recent_trips rt ON hp.household_id = rt.household_id
+LEFT JOIN prior_trips pt ON hp.household_id = pt.household_id
 WHERE hp.is_active = TRUE
-  AND (tc.transaction_count IS NULL OR tc.transaction_count < 5)
+  AND (
+    COALESCE(at.total_trips, 0) = 0
+    OR DATEDIFF(CURRENT_DATE(), CAST(at.last_transaction_ts AS DATE)) > 21
+    OR (COALESCE(pt.trips_prior_30d, 0) > 0
+        AND COALESCE(rt.trips_last_30d, 0) < pt.trips_prior_30d * 0.75)
+  )
 """)
 print("View 7 created: v2_ontology.abstractions.atrisk_customer_radar")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## View 8: kpm_audiences
+# MAGIC Key Performance Metric audiences — KetoDieter persona households with spend metrics
+# MAGIC and lifecycle stage. PDF spec Step 4 in the Keto flow.
+
+# COMMAND ----------
+
+spark.sql("""
+CREATE OR REPLACE VIEW v2_ontology.abstractions.kpm_audiences AS
+WITH hh_keto AS (
+  SELECT
+    t.household_id,
+    COUNT(DISTINCT CAST(t.transaction_ts AS DATE)) AS keto_purchase_days,
+    SUM(CASE WHEN c.is_keto_compliant = TRUE THEN t.quantity * t.unit_price ELSE 0 END)
+      AS keto_spend,
+    SUM(t.quantity * t.unit_price) AS total_spend,
+    SUM(CASE WHEN c.is_keto_compliant = TRUE THEN t.quantity * t.unit_price ELSE 0 END)
+      / NULLIF(SUM(t.quantity * t.unit_price), 0) AS keto_basket_share,
+    COUNT(DISTINCT CASE WHEN c.is_keto_compliant = TRUE THEN t.upc END)
+      AS keto_sku_count
+  FROM v2_raw.transactions.pos_transactions t
+  JOIN v2_ontology.bridge.sku_classifications c ON t.upc = c.upc
+  WHERE t.household_id IS NOT NULL
+  GROUP BY t.household_id
+),
+recent_trips AS (
+  SELECT
+    household_id,
+    COUNT(*) AS trips_last_30d
+  FROM v2_raw.transactions.pos_transactions
+  WHERE household_id IS NOT NULL
+    AND transaction_ts >= CURRENT_TIMESTAMP() - INTERVAL 30 DAYS
+  GROUP BY household_id
+)
+SELECT
+  hp.household_id,
+  hp.loyalty_tier,
+  hp.store_id_primary,
+  hp.age_band,
+  hp.has_pharmacy_rx,
+  COALESCE(hk.keto_basket_share, 0.0) AS keto_basket_share,
+  COALESCE(hk.keto_spend, 0.0) AS keto_spend,
+  COALESCE(hk.total_spend, 0.0) AS total_spend,
+  COALESCE(hk.keto_sku_count, 0) AS keto_sku_count,
+  -- primary_persona: KetoDieter requires keto_basket_share > 0.35 (PDF spec threshold)
+  CASE
+    WHEN COALESCE(hk.keto_basket_share, 0) > 0.35 THEN 'KetoDieter'
+    WHEN COALESCE(hk.keto_basket_share, 0) > 0.15 THEN 'KetoInterested'
+    ELSE 'General'
+  END AS primary_persona,
+  -- lifecycle_stage: based on recency and frequency
+  CASE
+    WHEN COALESCE(rt.trips_last_30d, 0) >= 4 AND COALESCE(hk.keto_basket_share, 0) > 0.35
+      THEN 'ActiveKetoDieter'
+    WHEN COALESCE(rt.trips_last_30d, 0) >= 2 AND COALESCE(hk.keto_basket_share, 0) > 0.35
+      THEN 'CasualKetoDieter'
+    WHEN COALESCE(hk.keto_basket_share, 0) > 0.35
+      THEN 'LapsedKetoDieter'
+    ELSE 'NonKeto'
+  END AS lifecycle_stage,
+  COALESCE(rt.trips_last_30d, 0) AS trips_last_30d
+FROM v2_raw.customers.household_profiles hp
+LEFT JOIN hh_keto hk ON hp.household_id = hk.household_id
+LEFT JOIN recent_trips rt ON hp.household_id = rt.household_id
+WHERE hp.is_active = TRUE
+  AND COALESCE(hk.keto_basket_share, 0) > 0.35
+""")
+print("View 8 created: v2_ontology.abstractions.kpm_audiences")
 
 # COMMAND ----------
 
@@ -270,8 +423,12 @@ view_registry_data = [
         source_tables="v2_raw.pharmacy.prescriptions, v2_raw.pharmacy.drug_interactions, v2_raw.customers.household_profiles",
         created_ts=datetime.utcnow(), created_by="ontology_bootstrap", is_active=True),
     Row(view_name="atrisk_customer_radar", schema_name="v2_ontology.abstractions",
-        description="Active customers with low transaction frequency indicating churn risk",
+        description="Customers with trip-frequency drop (current 30d vs prior 30d) — churn risk",
         source_tables="v2_raw.customers.household_profiles, v2_raw.transactions.pos_transactions",
+        created_ts=datetime.utcnow(), created_by="ontology_bootstrap", is_active=True),
+    Row(view_name="kpm_audiences", schema_name="v2_ontology.abstractions",
+        description="KPM persona audiences — KetoDieter (keto_basket_share>0.35) with lifecycle stage",
+        source_tables="v2_raw.customers.household_profiles, v2_raw.transactions.pos_transactions, v2_ontology.bridge.sku_classifications",
         created_ts=datetime.utcnow(), created_by="ontology_bootstrap", is_active=True),
 ]
 
@@ -279,7 +436,7 @@ spark.createDataFrame(view_registry_data) \
     .write.mode("overwrite") \
     .saveAsTable("v2_ontology.abstractions.view_registry")
 
-print("View registry created with 7 entries")
+print("View registry created with 8 entries")
 
 # COMMAND ----------
 
@@ -288,7 +445,7 @@ print("\n=== Verification ===")
 views = [
     "unified_inventory", "dietary_sku_catalog", "substitution_graph",
     "retail_media_audiences", "margin_aware_substitution",
-    "pharmacy_grocery_crosssell", "atrisk_customer_radar"
+    "pharmacy_grocery_crosssell", "atrisk_customer_radar", "kpm_audiences"
 ]
 for v in views:
     try:

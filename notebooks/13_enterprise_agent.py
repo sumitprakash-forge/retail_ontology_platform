@@ -11,6 +11,16 @@ from databricks.sdk import WorkspaceClient
 from datetime import datetime
 import uuid
 
+# MLflow tracing — import with graceful fallback
+try:
+    import mlflow
+    mlflow.set_experiment("/ontology-platform/agent-traces")
+    MLFLOW_AVAILABLE = True
+    print("MLflow tracing enabled")
+except Exception as e:
+    MLFLOW_AVAILABLE = False
+    print(f"MLflow not available: {e} — continuing without tracing")
+
 # COMMAND ----------
 
 # MAGIC %md
@@ -42,8 +52,33 @@ Total: $XX.XX | All items confirmed at [store_id]
 
 # COMMAND ----------
 
-def query_dietary_catalog(dietary_flag="is_keto", limit=20):
-    """Query the dietary SKU catalog for products matching a dietary flag."""
+# ── Domain Router ────────────────────────────────────────────────────────────
+# Routes user intent to the correct domain tool set. PDF spec requirement.
+
+DOMAIN_KEYWORDS = {
+    "dietary": ["keto", "vegan", "gluten", "organic", "dairy", "paleo", "plant", "diet", "meal", "food"],
+    "substitution": ["substitute", "replacement", "alternative", "out of stock", "oos", "similar"],
+    "inventory": ["available", "inventory", "stock", "in stock", "on hand", "where", "store"],
+    "persona": ["persona", "audience", "profile", "cohort", "customer", "household", "lifecycle"],
+    "pharmacy": ["pharmacy", "prescription", "drug", "medication", "rx", "medicine"],
+    "margin": ["margin", "profit", "price", "discount", "revenue", "cost"],
+}
+
+def domain_router(user_message):
+    """Route user message to a primary domain. Returns list of relevant domains."""
+    msg_lower = user_message.lower()
+    scores = {}
+    for domain, keywords in DOMAIN_KEYWORDS.items():
+        scores[domain] = sum(1 for kw in keywords if kw in msg_lower)
+    # Sort by score, return top 2 non-zero domains (or default to dietary)
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    active = [d for d, s in ranked if s > 0]
+    return active[:2] if active else ["dietary"]
+
+# ── Tools (PDF spec names) ────────────────────────────────────────────────────
+
+def find_keto_products(dietary_flag="is_keto", limit=20):
+    """Find products matching a dietary flag (replaces query_dietary_catalog)."""
     valid_flags = ["is_keto", "is_vegan", "is_gluten_free", "is_organic", "is_dairy_free", "is_paleo", "is_plant_based"]
     if dietary_flag not in valid_flags:
         dietary_flag = "is_keto"
@@ -59,27 +94,121 @@ def query_dietary_catalog(dietary_flag="is_keto", limit=20):
     rows = result.collect()
     return json.dumps([row.asDict() for row in rows], default=str)
 
+# keep alias for backwards compat
+query_dietary_catalog = find_keto_products
+
 # COMMAND ----------
 
-def query_substitutions(source_upc=None, limit=5):
-    """Query substitution graph for a given product UPC."""
+def get_substitutions(source_upc=None, limit=5):
+    """Get substitutions ranked by composite_score (dietary_fit × margin_multiplier × similarity)."""
     if source_upc:
         result = spark.sql(f"""
             SELECT source_upc, target_upc, source_product_name, target_product_name,
-                   similarity_score, shared_class_ids, is_dietary_safe
-            FROM v2_ontology.abstractions.substitution_graph
+                   similarity_score, composite_score, is_dietary_safe,
+                   dietary_fit_score, margin_multiplier, margin_delta
+            FROM v2_ontology.abstractions.margin_aware_substitution
             WHERE source_upc = '{source_upc}'
-            ORDER BY similarity_score DESC
+            ORDER BY composite_score DESC
             LIMIT {limit}
         """)
     else:
         result = spark.sql(f"""
             SELECT source_upc, target_upc, source_product_name, target_product_name,
-                   similarity_score, shared_class_ids, is_dietary_safe
-            FROM v2_ontology.abstractions.substitution_graph
-            ORDER BY similarity_score DESC
+                   similarity_score, composite_score, is_dietary_safe,
+                   dietary_fit_score, margin_multiplier, margin_delta
+            FROM v2_ontology.abstractions.margin_aware_substitution
+            ORDER BY composite_score DESC
             LIMIT {limit}
         """)
+    rows = result.collect()
+    return json.dumps([row.asDict() for row in rows], default=str)
+
+query_substitutions = get_substitutions  # alias
+
+# COMMAND ----------
+
+def check_inventory(upc=None, node_id=None, limit=10):
+    """Check inventory availability for a product at a node."""
+    conditions = []
+    if upc:
+        conditions.append(f"upc = '{upc}'")
+    if node_id:
+        conditions.append(f"node_id = '{node_id}'")
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
+    result = spark.sql(f"""
+        SELECT upc, product_name, node_id, node_type,
+               available_qty, on_hand_qty, reserved_qty,
+               reorder_point, snapshot_ts
+        FROM v2_ontology.abstractions.unified_inventory
+        {where}
+        ORDER BY available_qty DESC
+        LIMIT {limit}
+    """)
+    rows = result.collect()
+    return json.dumps([row.asDict() for row in rows], default=str)
+
+# COMMAND ----------
+
+def get_persona(household_id):
+    """Get household persona + lifecycle stage from kpm_audiences / retail_media_audiences."""
+    # Try kpm_audiences first for KetoDieter persona
+    try:
+        result = spark.sql(f"""
+            SELECT household_id, primary_persona, lifecycle_stage,
+                   keto_basket_share, keto_spend, trips_last_30d,
+                   loyalty_tier, store_id_primary
+            FROM v2_ontology.abstractions.kpm_audiences
+            WHERE household_id = '{household_id}'
+        """)
+        rows = result.collect()
+        if rows:
+            return json.dumps([row.asDict() for row in rows], default=str)
+    except Exception:
+        pass
+
+    # Fallback to retail_media_audiences
+    result = spark.sql(f"""
+        SELECT household_id, dietary_cohort AS primary_persona, loyalty_tier,
+               age_band, has_pharmacy_rx, is_active, store_id_primary
+        FROM v2_ontology.abstractions.retail_media_audiences
+        WHERE household_id = '{household_id}'
+    """)
+    rows = result.collect()
+    return json.dumps([row.asDict() for row in rows], default=str)
+
+query_customer_context = get_persona  # alias
+
+# COMMAND ----------
+
+def get_kpm_audience(persona="KetoDieter", limit=50):
+    """Get KPM audience segment — households matching a persona. PDF spec tool."""
+    result = spark.sql(f"""
+        SELECT household_id, primary_persona, lifecycle_stage,
+               keto_basket_share, total_spend, trips_last_30d,
+               loyalty_tier, store_id_primary
+        FROM v2_ontology.abstractions.kpm_audiences
+        WHERE primary_persona = '{persona}'
+        ORDER BY keto_basket_share DESC
+        LIMIT {limit}
+    """)
+    rows = result.collect()
+    return json.dumps([row.asDict() for row in rows], default=str)
+
+# COMMAND ----------
+
+def margin_aware_sub(source_upc, min_dietary_fit=0.5, limit=5):
+    """Get margin-optimised substitutions for an OOS product. PDF spec tool."""
+    result = spark.sql(f"""
+        SELECT source_upc, target_upc, target_product_name,
+               composite_score, dietary_fit_score, margin_multiplier,
+               margin_delta, similarity_score, is_dietary_safe
+        FROM v2_ontology.abstractions.margin_aware_substitution
+        WHERE source_upc = '{source_upc}'
+          AND dietary_fit_score >= {min_dietary_fit}
+        ORDER BY composite_score DESC
+        LIMIT {limit}
+    """)
     rows = result.collect()
     return json.dumps([row.asDict() for row in rows], default=str)
 
@@ -104,70 +233,103 @@ def query_pharmacy_crosssell(household_id=None, limit=10):
 
 # COMMAND ----------
 
-def query_customer_context(household_id):
-    """Query customer context including dietary preferences and activity."""
-    result = spark.sql(f"""
-        SELECT household_id, dietary_cohort, loyalty_tier, age_band,
-               has_pharmacy_rx, is_active, store_id_primary
-        FROM v2_ontology.abstractions.retail_media_audiences
-        WHERE household_id = '{household_id}'
-    """)
-    rows = result.collect()
-    return json.dumps([row.asDict() for row in rows], default=str)
-
-# COMMAND ----------
-
 # MAGIC %md
 # MAGIC ## Agent Orchestration
 
 # COMMAND ----------
 
 TOOLS = {
-    "query_dietary_catalog": query_dietary_catalog,
-    "query_substitutions": query_substitutions,
+    "find_keto_products": find_keto_products,
+    "get_substitutions": get_substitutions,
+    "check_inventory": check_inventory,
+    "get_persona": get_persona,
+    "get_kpm_audience": get_kpm_audience,
+    "margin_aware_sub": margin_aware_sub,
     "query_pharmacy_crosssell": query_pharmacy_crosssell,
-    "query_customer_context": query_customer_context,
 }
 
 def run_agent(user_message, household_id=None):
-    """Simple agent loop: gather context from tools, then generate response."""
+    """Agent loop with domain router, MLflow tracing, and spec-named tools."""
 
-    # Step 1: Get customer context if household provided
-    customer_context = ""
-    if household_id:
-        customer_context = query_customer_context(household_id)
-        print(f"Customer context: {customer_context}")
+    run_id = str(uuid.uuid4())[:8]
+    trace_data = {"run_id": run_id, "tools_called": [], "domains": []}
 
-    # Step 2: Get keto products (default tool for meal plan requests)
-    keto_products = query_dietary_catalog(dietary_flag="is_keto", limit=30)
-    print(f"Found {len(json.loads(keto_products))} keto products")
+    # Start MLflow trace span
+    mlflow_run = None
+    if MLFLOW_AVAILABLE:
+        try:
+            mlflow_run = mlflow.start_run(run_name=f"agent-{run_id}")
+            mlflow.log_param("household_id", household_id or "anonymous")
+            mlflow.log_param("user_message", user_message[:200])
+        except Exception:
+            mlflow_run = None
 
-    # Step 3: Check for substitutions availability
-    substitutions = query_substitutions(limit=5)
-    print(f"Sample substitutions loaded")
+    try:
+        # Step 1: Domain routing — determine which tools to call
+        domains = domain_router(user_message)
+        trace_data["domains"] = domains
+        print(f"Domain router → {domains}")
 
-    # Step 4: Check pharmacy cross-sell if relevant
-    pharmacy_info = ""
-    if household_id:
-        pharmacy_info = query_pharmacy_crosssell(household_id=household_id, limit=5)
-        print(f"Pharmacy cross-sell info loaded")
+        # Step 2: Get customer persona if household provided
+        customer_context = ""
+        if household_id:
+            customer_context = get_persona(household_id)
+            trace_data["tools_called"].append("get_persona")
+            print(f"Persona loaded for {household_id}")
 
-    # Step 5: Build prompt with tool results and call LLM
-    tool_context = f"""
-CUSTOMER CONTEXT:
+        # Step 3: Load tools based on routing
+        keto_products = ""
+        if "dietary" in domains:
+            keto_products = find_keto_products(dietary_flag="is_keto", limit=30)
+            trace_data["tools_called"].append("find_keto_products")
+            print(f"Found {len(json.loads(keto_products))} keto products")
+
+        substitutions = ""
+        if "substitution" in domains or "margin" in domains:
+            substitutions = get_substitutions(limit=5)
+            trace_data["tools_called"].append("get_substitutions")
+            print("Substitutions (margin-aware) loaded")
+
+        inventory_info = ""
+        if "inventory" in domains:
+            inventory_info = check_inventory(limit=10)
+            trace_data["tools_called"].append("check_inventory")
+            print("Inventory loaded")
+
+        kpm_info = ""
+        if "persona" in domains:
+            kpm_info = get_kpm_audience(persona="KetoDieter", limit=20)
+            trace_data["tools_called"].append("get_kpm_audience")
+            print("KPM audience loaded")
+
+        pharmacy_info = ""
+        if "pharmacy" in domains and household_id:
+            pharmacy_info = query_pharmacy_crosssell(household_id=household_id, limit=5)
+            trace_data["tools_called"].append("query_pharmacy_crosssell")
+            print("Pharmacy cross-sell loaded")
+
+        # Step 4: Build prompt
+        tool_context = f"""
+CUSTOMER PERSONA (from kpm_audiences / retail_media_audiences):
 {customer_context}
 
-AVAILABLE KETO PRODUCTS (from ontology dietary_sku_catalog):
+AVAILABLE KETO PRODUCTS (from ontology find_keto_products):
 {keto_products}
 
-SUBSTITUTION OPTIONS (from ontology substitution_graph):
+SUBSTITUTION OPTIONS — MARGIN-AWARE (from margin_aware_substitution, ranked by composite_score):
 {substitutions}
 
-PHARMACY CROSS-SELL (from ontology pharmacy_grocery_crosssell):
+INVENTORY STATUS (from unified_inventory):
+{inventory_info}
+
+KPM AUDIENCE CONTEXT (from kpm_audiences):
+{kpm_info}
+
+PHARMACY CROSS-SELL (from pharmacy_grocery_crosssell):
 {pharmacy_info}
 """
 
-    full_prompt = f"""{SYSTEM_PROMPT}
+        full_prompt = f"""{SYSTEM_PROMPT}
 
 {tool_context}
 
@@ -175,23 +337,42 @@ USER REQUEST: {user_message}
 
 Respond with a helpful answer using the product data above. Include specific products, prices, and availability."""
 
-    # Call Foundation Model API
-    try:
-        w = WorkspaceClient()
-        response = w.serving_endpoints.query(
-            name=LLM_ENDPOINT,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": full_prompt}
-            ],
-            max_tokens=1500,
-            temperature=0.1,
-        )
-        answer = response.choices[0].message.content
-    except Exception as e:
-        answer = f"LLM call failed ({e}). Tool results gathered successfully - see context above."
+        # Step 5: Call Foundation Model API
+        try:
+            w = WorkspaceClient()
+            response = w.serving_endpoints.query(
+                name=LLM_ENDPOINT,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": full_prompt}
+                ],
+                max_tokens=1500,
+                temperature=0.1,
+            )
+            answer = response.choices[0].message.content
+            trace_data["llm_status"] = "success"
+        except Exception as e:
+            answer = f"LLM call failed ({e}). Tool results gathered successfully - see context above."
+            trace_data["llm_status"] = f"failed: {e}"
 
-    return answer
+        # Log to MLflow
+        if MLFLOW_AVAILABLE and mlflow_run:
+            try:
+                mlflow.log_param("domains", ",".join(domains))
+                mlflow.log_param("tools_called", ",".join(trace_data["tools_called"]))
+                mlflow.log_metric("tools_count", len(trace_data["tools_called"]))
+                mlflow.log_text(answer[:2000], "agent_response.txt")
+            except Exception:
+                pass
+
+        return answer
+
+    finally:
+        if MLFLOW_AVAILABLE and mlflow_run:
+            try:
+                mlflow.end_run()
+            except Exception:
+                pass
 
 # COMMAND ----------
 
@@ -228,8 +409,11 @@ try:
         session_metadata=json.dumps({
             "query": test_query,
             "llm_endpoint": LLM_ENDPOINT,
-            "tools_used": ["query_dietary_catalog", "query_substitutions",
-                           "query_pharmacy_crosssell", "query_customer_context"]
+            "tools_used": ["find_keto_products", "get_substitutions", "check_inventory",
+                           "get_persona", "get_kpm_audience", "margin_aware_sub",
+                           "query_pharmacy_crosssell"],
+            "domain_router": "enabled",
+            "mlflow_tracing": MLFLOW_AVAILABLE
         })
     )
     spark.createDataFrame([session_row]) \
@@ -244,5 +428,7 @@ except Exception as e:
 
 print("Enterprise agent test complete!")
 print(f"  LLM Endpoint: {LLM_ENDPOINT}")
-print(f"  Tools: {list(TOOLS.keys())}")
+print(f"  Tools (PDF spec): {list(TOOLS.keys())}")
+print(f"  Domain Router: enabled")
+print(f"  MLflow Tracing: {MLFLOW_AVAILABLE}")
 print(f"  Session ID: {session_id}")

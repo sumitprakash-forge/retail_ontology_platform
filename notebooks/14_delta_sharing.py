@@ -86,6 +86,30 @@ print("Sharing view 3 created: cpg_substitution_insights")
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ## Create Sharing View 4: kpm_audiences
+# MAGIC KPM persona counts for CPG — persona sizes WITHOUT PII.
+# MAGIC CPG can query: SELECT COUNT(*) FROM kpm_audiences WHERE primary_persona='KetoDieter'
+
+# COMMAND ----------
+
+spark.sql("""
+CREATE OR REPLACE VIEW v2_ontology.sharing.kpm_audiences AS
+SELECT
+  primary_persona,
+  lifecycle_stage,
+  loyalty_tier,
+  COUNT(*) AS household_count,
+  ROUND(AVG(keto_basket_share), 4) AS avg_keto_basket_share,
+  ROUND(AVG(total_spend), 2) AS avg_total_spend,
+  ROUND(AVG(trips_last_30d), 2) AS avg_trips_last_30d
+FROM v2_ontology.abstractions.kpm_audiences
+GROUP BY primary_persona, lifecycle_stage, loyalty_tier
+""")
+print("Sharing view 4 created: kpm_audiences (persona counts, no PII)")
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ## Create Delta Share
 
 # COMMAND ----------
@@ -100,7 +124,8 @@ try:
     sharing_views = [
         "v2_ontology.sharing.cpg_product_performance",
         "v2_ontology.sharing.cpg_dietary_audiences",
-        "v2_ontology.sharing.cpg_substitution_insights"
+        "v2_ontology.sharing.cpg_substitution_insights",
+        "v2_ontology.sharing.kpm_audiences"
     ]
     for view in sharing_views:
         try:
@@ -128,6 +153,7 @@ sharing_views = {
     "cpg_product_performance": "v2_ontology.sharing.cpg_product_performance",
     "cpg_dietary_audiences": "v2_ontology.sharing.cpg_dietary_audiences",
     "cpg_substitution_insights": "v2_ontology.sharing.cpg_substitution_insights",
+    "kpm_audiences": "v2_ontology.sharing.kpm_audiences",
 }
 
 print("=== PII Check for Sharing Views ===")
@@ -155,4 +181,5 @@ else:
 print("\nDelta Sharing setup complete!")
 print(f"  Schema: v2_ontology.sharing")
 print(f"  Views: {list(sharing_views.keys())}")
+print(f"  kpm_audiences: persona counts without PII — CPG can count by primary_persona")
 print(f"  Share created: {share_created}")

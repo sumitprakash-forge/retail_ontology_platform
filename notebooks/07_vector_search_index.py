@@ -10,30 +10,19 @@ import subprocess, sys, time
 
 # Install databricks-vectorsearch if not already available
 # (may fail in NPIP/NSG environments — skip VS setup gracefully if unavailable)
-VectorSearchClient = None
 try:
     from databricks.vector_search.client import VectorSearchClient
     print("databricks-vectorsearch already available")
 except ImportError:
     print("Installing databricks-vectorsearch...")
-    try:
-        result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "-q", "--timeout=10", "--retries=1", "databricks-vectorsearch"],
-            capture_output=True, text=True, timeout=60
-        )
-        if result.returncode != 0:
-            print(f"pip install warning: {result.stderr[:300]}")
-    except Exception as pip_err:
-        print(f"pip install error (non-fatal): {pip_err}")
-    try:
-        from databricks.vector_search.client import VectorSearchClient
-        print("databricks-vectorsearch installed")
-    except ImportError:
-        print("Warning: databricks-vectorsearch not available (NSG blocks PyPI). Skipping VS setup.")
-
-if VectorSearchClient is None:
-    print("Vector Search setup skipped — client library unavailable.")
-    dbutils.notebook.exit("SUCCESS")
+    result = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-q", "databricks-vectorsearch"],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        print(f"pip install warning: {result.stderr[:500]}")
+    from databricks.vector_search.client import VectorSearchClient
+    print("databricks-vectorsearch installed")
 
 VS_ENDPOINT_NAME = "ontology-product-similarity"
 SOURCE_TABLE = "v2_features.product_features.product_embeddings"
