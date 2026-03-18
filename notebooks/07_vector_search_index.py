@@ -8,21 +8,35 @@
 
 import subprocess, sys, time
 
-# Install databricks-vectorsearch if not already available
-# (may fail in NPIP/NSG environments — skip VS setup gracefully if unavailable)
+# Install databricks-vectorsearch if not already available.
+# Fails gracefully if NSG blocks PyPI — downstream tasks are not affected.
+VectorSearchClient = None
+_vs_unavailable_reason = None
+
 try:
     from databricks.vector_search.client import VectorSearchClient
     print("databricks-vectorsearch already available")
 except ImportError:
     print("Installing databricks-vectorsearch...")
-    result = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "-q", "databricks-vectorsearch"],
-        capture_output=True, text=True
-    )
-    if result.returncode != 0:
-        print(f"pip install warning: {result.stderr[:500]}")
-    from databricks.vector_search.client import VectorSearchClient
-    print("databricks-vectorsearch installed")
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-q",
+             "--timeout=30", "--retries=1", "databricks-vectorsearch"],
+            capture_output=True, text=True, timeout=90
+        )
+        if result.returncode != 0:
+            _vs_unavailable_reason = f"pip failed: {result.stderr[:300]}"
+            print(f"pip install failed: {_vs_unavailable_reason}")
+        else:
+            from databricks.vector_search.client import VectorSearchClient
+            print("databricks-vectorsearch installed successfully")
+    except Exception as install_err:
+        _vs_unavailable_reason = str(install_err)
+        print(f"pip install error: {_vs_unavailable_reason}")
+
+if VectorSearchClient is None:
+    print(f"Vector Search SDK unavailable ({_vs_unavailable_reason}). Skipping VS setup.")
+    dbutils.notebook.exit("SKIPPED: Vector Search SDK not available")
 
 VS_ENDPOINT_NAME = "ontology-product-similarity"
 SOURCE_TABLE = "v2_features.product_features.product_embeddings"
