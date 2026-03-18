@@ -1,557 +1,597 @@
-# Retail Ontology Platform — End-to-End Guide
+# Retail Ontology-Driven Intelligence Platform
 
-A three-tier retail product ontology built on Databricks, combining LLM classification,
-basket-co-occurrence embeddings, and a semantic graph to power AI shopping assistants,
-real-time substitution engines, and CPG data sharing.
+An enterprise-grade, 5-layer retail intelligence platform built on Databricks Lakehouse. Combines a governed ontology, LLM classification, graph-based substitution reasoning, and a LangGraph multi-tool agent to power AI shopping assistants, Genie NL2SQL, Retail Media Networks, and CPG Delta Sharing — all with dietary-class preservation and zero PII exposure.
 
 ---
 
 ## Table of Contents
 
 1. [Architecture Overview](#architecture-overview)
-2. [Data Model](#data-model)
-3. [Pipeline Stages — What Each Notebook Does](#pipeline-stages)
-4. [The Keto Use Case End-to-End](#the-keto-use-case-end-to-end)
-5. [Deployment Prerequisites](#deployment-prerequisites)
-6. [How to Deploy](#how-to-deploy)
-7. [How to Run the Pipeline](#how-to-run-the-pipeline)
-8. [Rerunning Failed Tasks](#rerunning-failed-tasks)
-9. [Catalog & Schema Reference](#catalog--schema-reference)
+2. [Layer 1 — Facts (Raw Data)](#layer-1--facts-raw-data)
+3. [Layer 2 — Ontology](#layer-2--ontology)
+4. [Layer 3 — Semantic Views](#layer-3--semantic-views)
+5. [Layer 4 — Agent & Reasoning](#layer-4--agent--reasoning)
+6. [Layer 5 — Consumption](#layer-5--consumption)
+7. [Keto End-to-End Flow (Diagram 2)](#keto-end-to-end-flow-diagram-2)
+8. [Pipeline Stages & Notebooks](#pipeline-stages--notebooks)
+9. [Deployment Guide](#deployment-guide)
+10. [Catalog & Schema Reference](#catalog--schema-reference)
 
 ---
 
 ## Architecture Overview
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│  TIER 1 — Universal Foundation (frozen, ARB-governed)           │
-│  v2_ontology.tier1_foundation                                   │
-│  8 top-level classes: Entity, Event, Location, TimeInterval,    │
-│  Relationship, Quantity, Role, Attribute                        │
-│  9 relationship types: SUBSTITUTABLE_FOR, HAS_INVENTORY, ...   │
-└────────────────────────┬─────────────────────────────────────────┘
-                         │ inherits from
-┌────────────────────────▼─────────────────────────────────────────┐
-│  TIER 2 — Domain Classes (7 domains, ~92 classes)               │
-│  v2_ontology.tier2_product / tier2_customer / tier2_supply_chain│
-│  tier2_store_ops / tier2_pharmacy / tier2_finance / tier2_media  │
-│  Graph edges live in v2_ontology.graph.relationships            │
-│  AI bridge: v2_ontology.bridge.sku_classifications              │
-└────────────────────────┬─────────────────────────────────────────┘
-                         │ exposed via
-┌────────────────────────▼─────────────────────────────────────────┐
-│  TIER 3 — Abstractions & Serving (business-ready views)         │
-│  v2_ontology.abstractions.*  — 7 cross-domain views             │
-│  v2_ontology.metrics.*       — metric views (Genie-ready)       │
-│  v2_ontology.graph.sku_online_lookup / household_online_lookup  │
-│  v2_features.product_features.product_embeddings               │
-└──────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  LAYER 5 — CONSUMPTION                                                      │
+│  AI Shopping Assistant │ Genie NL2SQL │ Retail Media Network │ Delta Sharing│
+└───────────────────────────────────┬─────────────────────────────────────────┘
+                                    │
+┌───────────────────────────────────▼─────────────────────────────────────────┐
+│  LAYER 4 — AGENT & REASONING                                                │
+│  LangGraph StateGraph (8 nodes) · Llama 3.3 70B (Foundation Model API)     │
+│  Domain Router · MLflow Tracing · Lakebase Agent Memory                    │
+│  Lakeflow DLT Pipeline (bronze/silver/gold + daily persona refresh)         │
+│  Vector Search Index (graceful skip if PyPI blocked)                        │
+└───────────────────────────────────┬─────────────────────────────────────────┘
+                                    │
+┌───────────────────────────────────▼─────────────────────────────────────────┐
+│  LAYER 3 — SEMANTIC VIEWS                                                   │
+│  8 Abstract Views (dietary_sku_catalog, substitution_graph, kpm_audiences,  │
+│    unified_inventory, pharmacy_crosssell, atrisk_customer_radar,            │
+│    margin_aware_substitution, retail_media_audiences)                       │
+│  12 Metric Views (keto_households, net_revenue, digital_penetration,        │
+│    avg_basket_size, at_risk_value + 7 existing KPIs)                        │
+└───────────────────────────────────┬─────────────────────────────────────────┘
+                                    │
+┌───────────────────────────────────▼─────────────────────────────────────────┐
+│  LAYER 2 — ONTOLOGY                                                         │
+│  Tier 1: 8 Universal Frozen Classes + version_registry (ARB-governed)       │
+│  Tier 2: 7 Domain Schemas (product, customer, supply_chain,                 │
+│          pharmacy, finance, media) · ~92 classes                            │
+│  Bridge Tables: sku_classifications (LLM) · household_lifecycle ·           │
+│          rx_therapeutic_class · sku_gs1_mapping                             │
+│  Graph: relationships (SUBSTITUTABLE_FOR edges)                             │
+└───────────────────────────────────┬─────────────────────────────────────────┘
+                                    │
+┌───────────────────────────────────▼─────────────────────────────────────────┐
+│  LAYER 1 — FACTS (RAW DATA)                                                 │
+│  Delta Lake: pos_transactions · sku_master · household_profiles ·           │
+│  node_inventory_snapshots · rx_claims                                       │
+│  CDC enabled · Partitioned · UC Row-Level Security · Column Tags (PII)      │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Four Unity Catalog catalogs:**
+**Unity Catalog layout:**
 
-| Catalog | Purpose |
-|---------|---------|
-| `v2_raw` | Raw source tables: POS transactions, SKU master, household profiles, inventory, pharmacy |
-| `v2_ontology` | Ontology structure, graph edges, AI classifications, abstract views |
-| `v2_features` | ML feature store: product and household ALS embeddings |
-| `v2_sharing` | Delta Sharing views for CPG partners (no PII) |
+| Catalog | Layer | Purpose |
+|---------|-------|---------|
+| `v2_raw` | L1 | Raw source tables — POS, SKU, households, inventory, pharmacy |
+| `v2_ontology` | L2 / L3 | Ontology classes, graph edges, bridge tables, abstract/metric views |
+| `v2_features` | L4 | ML embeddings — 128-dim ALS product & household vectors |
+| `v2_sharing` | L5 | Delta Sharing views for CPG partners (no PII) |
 
 ---
 
-## Data Model
+## Layer 1 — Facts (Raw Data)
 
-### Raw Layer (`v2_raw`)
+**Notebook:** `01_create_raw_schema.py` + `02_generate_sample_data.py`
+
+### Tables
 
 | Table | Rows | Description |
 |-------|------|-------------|
-| `transactions.pos_transactions` | 500K | Point-of-sale transactions with UPC, household, price, qty |
-| `products.sku_master` | 10K | Product catalog: name, brand, dept, category, price |
-| `customers.household_profiles` | 50K | Household demographics: loyalty tier, age band, store |
-| `inventory.node_inventory_snapshots` | ~500K | On-hand / reserved / in-transit by node (store/DC) |
-| `pharmacy.rx_claims` | — | Pharmacy prescription data for cross-sell signals |
+| `v2_raw.transactions.pos_transactions` | 500K | Point-of-sale: UPC, household_id, store_id, qty, price, timestamp |
+| `v2_raw.products.sku_master` | 10K | SKU catalog: name, brand, dept, category, certifications, price |
+| `v2_raw.customers.household_profiles` | 50K | Household demographics: loyalty_tier, age_band, dietary_preference |
+| `v2_raw.inventory.node_inventory_snapshots` | ~500K | On-hand / reserved / in-transit by store/DC node |
+| `v2_raw.pharmacy.rx_claims` | — | Prescription data for pharmacy cross-sell signals |
 
-### Ontology Layer (`v2_ontology`)
+### Governance
 
-| Schema | Key Tables / Views | Description |
-|--------|-------------------|-------------|
-| `tier1_foundation` | `classes_top`, `relationship_types` | Frozen universal taxonomy |
-| `tier2_product` | `classes`, `entities` | 24 product domain classes (FoodProduct, KetoCompliant, etc.) |
-| `tier2_customer` | `classes`, `entities` | 18 customer domain classes |
-| `bridge` | `sku_classifications` | LLM-generated dietary/allergen/pharmacy flags per SKU |
-| `graph` | `relationships`, `sku_online_lookup`, `household_online_lookup` | Semantic edges + serving tables |
-| `abstractions` | 7 views | Cross-domain joins ready for agents and BI |
-| `metrics` | 4 views | Business metric definitions for Genie/SQL |
-| `sharing` | 3 views | CPG partner views (aggregated, no PII) |
+- **Change Data Feed (CDF)** enabled on all tables for incremental downstream propagation
+- **Partitioning:** `pos_transactions` by `transaction_date`; `node_inventory_snapshots` by `snapshot_date`
+- **UC Column Tags:** PII columns on `household_profiles` (`email`, `phone`, `address`) tagged as `pii_category = PII`
+- **Row-Level Security:** Row Filter on `household_profiles` — non-admin users see only `is_active = TRUE` rows
+- **Storage:** `abfss://nsp-test-data@stnsphv9452.dfs.core.windows.net/ontology/` (ADLS Gen2 managed location)
 
 ---
 
-## Pipeline Stages
+## Layer 2 — Ontology
 
-The pipeline runs as a **Databricks Workflow** (Job ID `1033153680345706`) on an all-purpose
-cluster (DBR 17.3 LTS ML, `Standard_D16s_v3`, autoscale 2–8). Notebooks are executed in
-dependency order:
+**Notebooks:** `03a_create_tier1_foundation.py`, `03b_seed_tier1_foundation.py`, `04a_create_tier2_schemas.py`, `04b_seed_all_domains.py`, `05_llm_sku_classification.py`, `12_lakebase_setup.py`
+
+### Tier 1 — Universal Foundation (Frozen)
+
+Schema: `v2_ontology.tier1_foundation`
+
+| Table | Contents |
+|-------|---------|
+| `classes_top` | 8 universal classes: Entity, Event, Location, TimeInterval, Relationship, Quantity, Role, Attribute |
+| `relationship_types` | 9 valid relationship codes: SUBSTITUTABLE_FOR, HAS_INVENTORY, PURCHASED_BY, … |
+| `domain_registry` | 7 registered tier-2 domain names |
+| `governance_log` | ARB change log — all modifications require Architecture Review Board approval |
+| `version_registry` | Schema versioning table — tracks schema_version, effective_date, change_summary |
+
+> **CRITICAL:** Tier 1 is frozen after initial seeding. Any modification requires `governance_log` entry and ARB sign-off.
+
+### Tier 2 — Domain Classes (~92 classes across 7 domains)
+
+| Domain Schema | Key Classes |
+|--------------|-------------|
+| `tier2_product` | FoodProduct, KetoCompliant, Vegan, GlutenFree, Organic, DairyFree, Paleo, PlantBased, MediterraneanDiet, PharmacyProduct |
+| `tier2_customer` | HouseholdProfile, LoyaltyTier, DietaryPreference, LifecycleStage, KetoDieter |
+| `tier2_supply_chain` | InventoryNode, StockUnit, ReplenishmentOrder |
+| `tier2_pharmacy` | RxClaim, TherapeuticClass, CrossSellOpportunity |
+| `tier2_finance` | MarginSegment, PricePoint, RevenueDriver |
+| `tier2_media` | RetailMediaAudience, PersonaSegment, AdvertiserTarget |
+| `tier2_store_ops` | StoreNode, DistributionCenter, NodeInventory |
+
+### Bridge Tables (AI-Computed)
+
+| Table | Source | Contents |
+|-------|--------|---------|
+| `v2_ontology.bridge.sku_classifications` | LLM (Llama 3.3 70B) | Dietary flags, allergen flags, margin segment, pharmacy classification per SKU |
+| `v2_ontology.bridge.household_lifecycle` | 90-day transactions | Lifecycle stage (ACTIVE/AT_RISK/LAPSED/NEW) per household, computed from trip frequency |
+| `v2_ontology.bridge.rx_therapeutic_class` | rx_claims | Therapeutic class mapping per prescription |
+| `v2_ontology.bridge.sku_gs1_mapping` | sku_master | GS1 department/category/brick code mapping per SKU |
+
+### Graph — Semantic Relationships
+
+Table: `v2_ontology.graph.relationships`
+
+Contains `SUBSTITUTABLE_FOR` edges with:
+- `source_entity_id` / `target_entity_id` — UPC codes
+- `weight` — cosine similarity score (threshold: > 0.5)
+- `shared_class_ids` — dietary classes preserved by both products (e.g. `["KetoCompliant","Vegan","DairyFree"]`)
+- `rel_type = SUBSTITUTABLE_FOR`
+
+**Dietary class preservation rule:** Both source and target must share at least one dietary class. This prevents keto shoppers from receiving non-keto substitutions.
+
+Also includes serving tables:
+- `v2_ontology.graph.sku_online_lookup` — SKU master + all LLM flags (10K rows, agent serving)
+- `v2_ontology.graph.household_online_lookup` — household profiles + 90-day transaction stats
+
+### LLM Classification (Stage 05)
+
+Model: **Meta Llama 3.3 70B Instruct** (Databricks Foundation Model API — no external API keys)
+
+- **Throughput:** 20 parallel threads, batches of 10 SKUs
+- **Runtime:** ~25 minutes for 10K SKUs
+- **Output per SKU:**
+
+```json
+{
+  "dietary": {
+    "is_keto_compliant": true,
+    "is_vegan": true,
+    "is_gluten_free": true,
+    "is_organic": false,
+    "is_dairy_free": true,
+    "is_paleo": false,
+    "is_plant_based": true,
+    "is_mediterranean": false
+  },
+  "allergens": {
+    "contains_tree_nuts": true,
+    "contains_dairy": false,
+    "contains_gluten": false
+  },
+  "margin": { "margin_segment": "HIGH|MED|LOW" },
+  "pharmacy": {
+    "is_pharmacy_product": false,
+    "therapeutic_class": ""
+  }
+}
+```
+
+> **Keto rule enforced in the prompt:** `is_keto_compliant = TRUE` only if net carbs ≤ 5g/serving. Almond Milk (~1g carb) ✅, Oat Milk (~12g carb) ❌.
+
+---
+
+## Layer 3 — Semantic Views
+
+**Notebooks:** `09_create_abstract_views.py`, `10_create_metric_views.py`
+
+### 8 Abstract Views (`v2_ontology.abstractions.*`)
+
+| View | Key Joins | Primary Use Case |
+|------|-----------|-----------------|
+| `dietary_sku_catalog` | sku_master + sku_classifications | "Show me all keto products" — filtered product catalog |
+| `substitution_graph` | graph.relationships + sku_master + sku_classifications | "What can replace Almond Milk?" — dietary-preserving substitutes |
+| `kpm_audiences` | household_profiles + pos_transactions + sku_classifications | KPM persona segmentation — KetoDieter: `keto_basket_share > 0.35` |
+| `unified_inventory` | node_inventory_snapshots + sku_master | Real-time stock check by product and store |
+| `pharmacy_crosssell` | rx_claims + rx_therapeutic_class + dietary_sku_catalog | Pharmacy-adjacent dietary product recommendations |
+| `atrisk_customer_radar` | household_lifecycle + pos_transactions | Churn detection — trip frequency drop (current 30d vs prior 30d), `churn_risk_score HIGH/MEDIUM/LOW` |
+| `margin_aware_substitution` | substitution_graph + sku_classifications | `composite_score = dietary_fit_score × margin_multiplier × similarity_score` |
+| `retail_media_audiences` | kpm_audiences + household_profiles | Retail Media Network targeting segments |
+
+#### kpm_audiences — KPM Persona Logic
+
+```sql
+-- KetoDieter persona: keto_basket_share > 0.35
+SELECT
+  h.household_id,
+  h.loyalty_tier,
+  h.lifecycle_stage,
+  COUNT(DISTINCT CASE WHEN c.is_keto_compliant THEN t.upc END) * 1.0 /
+    NULLIF(COUNT(DISTINCT t.upc), 0) AS keto_basket_share,
+  CASE
+    WHEN keto_basket_share > 0.35 THEN 'KetoDieter'
+    ELSE 'GeneralShopper'
+  END AS persona
+FROM household_profiles h JOIN pos_transactions t JOIN sku_classifications c ...
+```
+
+#### margin_aware_substitution — Composite Score
+
+```
+composite_score = dietary_fit_score × margin_multiplier × similarity_score
+  dietary_fit_score  = shared dietary class count / total dietary classes
+  margin_multiplier  = 1.2 (HIGH margin) | 1.0 (MED) | 0.8 (LOW)
+  similarity_score   = cosine similarity from ALS embeddings
+```
+
+### 12 Metric Views (`v2_ontology.metrics.*`)
+
+#### 5 PDF Spec KPMs (added)
+
+| View | Metric Definition |
+|------|-----------------|
+| `keto_households` | Count of households with `keto_basket_share > 0.35` (KetoDieter persona) |
+| `net_revenue` | Gross sales minus returns and markdowns by day/category |
+| `digital_penetration` | % of transactions originating from digital/app channel |
+| `avg_basket_size` | Average items and spend per shopping trip by loyalty tier |
+| `at_risk_value` | Revenue at risk from HIGH churn_risk_score households |
+
+#### 7 Existing KPMs
+
+| View | Metric |
+|------|--------|
+| `daily_sales_performance` | Transaction count, revenue, avg basket value by day |
+| `inventory_health` | On-hand qty, days-of-supply, below-reorder flag by node+UPC |
+| `dietary_category_sales` | Sales by dietary classification |
+| `household_segment_value` | Total spend, trip frequency by loyalty segment |
+| `substitution_conversion` | How often OOS substitutions are accepted |
+| `keto_compliance_rate` | % of keto-classified SKUs offered as substitutes that are truly keto |
+| `pharmacy_crosssell_rate` | Pharmacy cross-sell attachment rate |
+
+---
+
+## Layer 4 — Agent & Reasoning
+
+**Notebooks:** `06_basket2vec_embeddings.py`, `07_vector_search_index.py`, `08_build_substitution_graph.py`, `11_lakeflow_pipeline.py`, `12_lakebase_setup.py`, `13_enterprise_agent.py`
+
+### MLlib ALS Embeddings (Stage 06)
+
+Model: **MLlib ALS** (Alternating Least Squares) on basket co-occurrence
+
+- `rank = 128` (128-dimensional item and user factors)
+- `alpha = 40`, `implicitPrefs = True` (purchase count as implicit feedback)
+- Input: 90-day POS transactions (household × UPC implicit matrix)
+- Output:
+  - `v2_features.product_features.product_embeddings` — 128-dim vectors per UPC (10K rows)
+  - `v2_features.household_features.household_embeddings` — 128-dim vectors per household (50K rows)
+
+> **Implementation note:** The PDF spec called for Word2Vec 256-dim. MLlib ALS 128-dim was used instead — it produces richer co-occurrence signal from basket data than Word2Vec and runs fully on Spark without external dependencies.
+
+### Vector Search Index (Stage 07)
+
+- Creates a Databricks Vector Search endpoint and delta-sync index over `product_embeddings`
+- **Graceful degradation:** If `databricks-vectorsearch` is unavailable (PyPI blocked by NSG), the notebook calls `dbutils.notebook.exit("SKIPPED")` and the pipeline continues
+- The substitution graph (Stage 08) provides equivalent batch cosine similarity via native Spark SQL
+
+### Substitution Graph — SUBSTITUTABLE_FOR Edges (Stage 08)
+
+**Algorithm:**
+
+1. Sample up to 3,000 products from `product_embeddings`
+2. Pairwise cosine similarity via Spark SQL (JVM-native `aggregate` + `zip_with`):
+   ```sql
+   aggregate(zip_with(vec_a, vec_b, (x, y) -> x * y), 0.0, (acc, v) -> acc + v)
+   / (sqrt(aggregate(vec_a, ...)) * sqrt(aggregate(vec_b, ...)))
+   ```
+3. Keep pairs with `cosine_sim > 0.5`
+4. Join with `sku_classifications` — keep pairs where BOTH products share ≥ 1 dietary class
+5. Write edges to `v2_ontology.graph.relationships`
+
+> **Threshold note:** ALS factors produce lower cosine range than text/Word2Vec embeddings. Threshold of 0.5 is appropriate for ALS co-occurrence vectors.
+
+### LangGraph StateGraph Agent (Stage 13)
+
+Framework: **LangGraph** (`langgraph>=0.2`) — compiled StateGraph with typed state
+
+#### Agent State
+
+```python
+class AgentState(TypedDict):
+    user_message: str
+    household_id: str
+    domains: list            # ["dietary","substitution","inventory","kpm","pharmacy"]
+    customer_context: str
+    keto_products: str
+    substitutions: str
+    inventory_info: str
+    kpm_info: str
+    pharmacy_info: str
+    tools_called: Annotated[list, operator.add]
+    response: str
+```
+
+#### Graph Topology (8 nodes)
+
+```
+START
+  └── route_node        (domain classification from user message)
+        └── persona_node      (household profile + keto_basket_share lookup)
+              └── dietary_node      (keto product catalog query)
+                    └── substitution_node   (SUBSTITUTABLE_FOR graph lookup)
+                          └── inventory_node    (stock check — unified_inventory)
+                                └── kpm_node          (kpm_audiences persona lookup)
+                                      └── pharmacy_node   (pharmacy cross-sell)
+                                            └── llm_node    (Llama 3.3 70B synthesis)
+                                                  └── END
+```
+
+Each node conditionally executes based on `state.domains` — nodes whose domain is not in scope are no-ops that pass state through unchanged.
+
+#### LLM Node
+
+- Model: `databricks-meta-llama-3-3-70b-instruct` (Foundation Model API)
+- Synthesizes all tool outputs into a single natural-language response
+- System prompt enforces dietary class preservation: *"For Keto customers, only suggest products where `is_keto=TRUE`. When a product is OOS, use substitutions that preserve dietary classes."*
+- MLflow autologging enabled — all traces, spans, and tool calls recorded in MLflow Experiments
+- `agent_version = "v2.0-langgraph"`
+
+### Lakebase Agent Memory (Stage 12)
+
+Persistent memory tables for cross-session agent context (Delta fallback if Lakebase Postgres unavailable):
+
+| Table | Purpose |
+|-------|---------|
+| `v2_ontology.graph.agent_sessions` | Conversation session tracking |
+| `v2_ontology.graph.agent_memory` | Key-value persistent memory per household |
+| `v2_ontology.graph.agent_tool_calls` | Full audit log of all tool executions |
+
+### Lakeflow DLT Pipeline (Stage 11)
+
+**Job config:** `ontology-daily-persona-refresh` (Databricks Workflow, cron: `0 3 * * *` UTC)
+
+```
+Bronze (raw stream)     → Silver (deduplicated/cleaned)     → Gold (aggregated)
+  pos_transactions_raw       pos_transactions_clean              daily_sales
+  inventory_raw              inventory_clean                     inventory_health
+                                                             Gold: gold_oos_alerts (OOS + substitute available)
+                                                             Gold: kpm_audiences_daily (persona refresh at 03:00 UTC)
+```
+
+- Photon enabled, CDF enabled, triggered mode (not continuous)
+- `gold_oos_alerts`: joins OOS inventory with substitution graph — pre-computed for low-latency agent serving
+- `kpm_audiences_daily`: daily persona refresh (KetoDieter recalculation at 03:00 UTC)
+
+---
+
+## Layer 5 — Consumption
+
+**Notebooks:** `13_enterprise_agent.py`, `14_delta_sharing.py`
+
+### AI Shopping Assistant
+
+The LangGraph agent (Stage 13) is the primary consumption interface. Household `HH00041872` ("Sarah") can ask:
+- *"I need Almond Milk but it's out of stock."* → OOS resolution with keto-safe substitutes
+- *"Build me a keto meal plan for the week."* → persona-aware product discovery
+- *"What pharmacy products pair with my prescriptions?"* → cross-sell via therapeutic class
+
+### Genie NL2SQL
+
+All 12 metric views in `v2_ontology.metrics` are Genie-ready — natural language queries like:
+- *"How many keto households do we have this month?"* → `keto_households` view
+- *"What is our net revenue by category?"* → `net_revenue` view
+- *"Which customers are at risk of churning?"* → `at_risk_value` + `atrisk_customer_radar`
+
+### Retail Media Network
+
+`retail_media_audiences` view surfaces KPM persona segments for advertiser targeting:
+- KetoDieter segment (keto_basket_share > 0.35)
+- At-risk high-value households (churn_risk HIGH + high lifetime value)
+- Pharmacy cross-sell candidates
+
+### Delta Sharing (CPG Partners)
+
+Share: `ontology-cpg-partner-share` | Recipient: `cpg-partner-demo`
+
+| Sharing View | Data Shared | PII? |
+|-------------|------------|------|
+| `cpg_product_performance` | Units sold, revenue, price elasticity by brand/category | None |
+| `cpg_dietary_audiences` | Persona counts by dietary segment (KetoDieter count, not IDs) | None |
+| `cpg_substitution_insights` | Which products substitute for which, and frequency | None |
+| `kpm_audiences` | Persona counts only — no household IDs, no PII | None |
+
+> **Privacy guarantee:** `kpm_audiences` is shared as persona-level aggregates (counts) only. No household IDs, no transaction details, no PII ever cross the share boundary.
+
+---
+
+## Keto End-to-End Flow (Diagram 2)
+
+This section traces **Sarah (HH00041872)**, a verified KetoDieter, through all 5 layers when Almond Milk is out of stock.
+
+### Step 1 — L1: Facts Established
+
+Raw data generation creates Sarah with keto-skewed basket history:
+- Household `HH00041872`: `dietary_preference = "keto"`, `loyalty_tier = "Gold"`
+- Basket: Almond Milk, Avocado, Chicken Breast, Spinach, Bacon, Coconut Oil
+
+Almond Milk SKU: `certifications = "KETO|VEGAN|GF|DAIRY_FREE"`, department = `DAIRY_ALT`
+Oat Milk SKU: `certifications = ""`, department = `CEREAL_GRAIN`
+
+### Step 2 — L2: LLM Classification
+
+LLM receives Almond Milk's product card:
+```
+Product: Almond Milk Unsweetened | Certifications: KETO|VEGAN|GF|DAIRY_FREE
+Keto Rule: net carbs ≤ 5g/serving → YES (~1g carb)
+```
+
+Result → `v2_ontology.bridge.sku_classifications`:
+```
+is_keto_compliant = TRUE  |  is_vegan = TRUE  |  is_dairy_free = TRUE
+```
+
+Oat Milk result: `is_keto_compliant = FALSE` (~12g carbs)
+
+### Step 3 — L2: Graph Classification (ALS → SUBSTITUTABLE_FOR)
+
+ALS learns from basket co-occurrence: Almond Milk, Avocado, Spinach, Coconut Milk all appear together in keto baskets → close vectors in 128-dim embedding space.
+
+Pairwise cosine:
+```
+cosine_sim(Almond Milk, Coconut Milk) = 0.89  →  SUBSTITUTABLE_FOR edge created
+cosine_sim(Almond Milk, Oat Milk)     = 0.21  →  below threshold, no edge
+```
+
+Shared class filter: Almond Milk ∩ Coconut Milk = `[KetoCompliant, Vegan, DairyFree, GlutenFree]` ✅
+
+Edge written to `v2_ontology.graph.relationships`:
+```
+source: Almond Milk UPC  →  target: Coconut Milk UPC
+weight: 0.89  |  shared_class_ids: [KetoCompliant, Vegan, DairyFree, GlutenFree]
+rel_type: SUBSTITUTABLE_FOR
+```
+
+### Step 4 — L2→L3: Persona Classification
+
+`kpm_audiences` view computes Sarah's persona:
+```
+keto_basket_share = (keto SKUs in basket) / (total SKUs in basket) = 0.41
+0.41 > 0.35 threshold → persona = 'KetoDieter'
+lifecycle_stage = 'ACTIVE'  (from household_lifecycle bridge table)
+```
+
+### Step 5 — L4: Agent Invocation (LangGraph)
+
+Sarah asks: *"I need Almond Milk but it's out of stock at my store."*
+
+LangGraph StateGraph executes:
+
+```
+route_node    →  domains = ["dietary", "substitution", "inventory"]
+persona_node  →  keto_basket_share=0.41, persona=KetoDieter, lifecycle=ACTIVE
+dietary_node  →  dietary_sku_catalog query: keto=TRUE → product catalog loaded
+substitution_node → graph.relationships WHERE source=AlmondMilk → [CoconutMilk 0.89, HeavyCream 0.61]
+inventory_node    → unified_inventory: AlmondMilk at STORE_042 → qty=0 (OOS)
+                    unified_inventory: CoconutMilk at STORE_042 → qty=24 ✅
+kpm_node      →  (skipped, kpm not in scope for this query)
+pharmacy_node →  (skipped)
+llm_node      →  Llama 3.3 70B synthesizes all context
+```
+
+MLflow trace records all 4 tool calls with inputs, outputs, and latency.
+
+### Step 6 — L3: OOS Resolution
+
+`margin_aware_substitution` view applies composite scoring:
+```
+Coconut Milk:  composite_score = 0.95 × 1.2 × 0.89 = 1.014  (HIGH margin)
+Heavy Cream:   composite_score = 0.85 × 1.0 × 0.61 = 0.519  (MED margin)
+```
+
+Top recommendation: **Coconut Milk** (keto ✅, highest composite score, in stock)
+
+### Step 7 — L5: Downstream Value
+
+Agent response to Sarah:
+> *"Almond Milk is currently out of stock at your store. Based on your keto preferences, I recommend Coconut Milk ($3.49, 24 units in stock) — it has the same dietary profile and is a great 1:1 substitution in keto recipes. Heavy Cream ($2.99, 18 units) is also keto-safe if you prefer a richer option."*
+
+Downstream:
+- **Delta Sharing** → CPG partner sees Almond Milk OOS event + Coconut Milk substitution in `cpg_substitution_insights`
+- **Retail Media** → KetoDieter segment in `retail_media_audiences` for coconut product advertisers
+- **Genie** → `keto_households` metric updated with Sarah's persona
+
+---
+
+## Pipeline Stages & Notebooks
+
+The pipeline runs as a **Databricks Workflow** (18 tasks, DBR 17.3 LTS ML, `Standard_D16s_v3`, autoscale 2–8):
 
 ```
 cleanup
   └── create_raw_schema
-        ├── generate_data ──────┬── embeddings ──┬── substitution_graph
-        │                       │               └── vector_search
-        │                       ├── lakeflow_pipeline
-        │                       └── llm_classification
+        ├── generate_data ─────────┬── embeddings ──┬── substitution_graph
+        │                          │               └── vector_search
+        │                          ├── lakeflow_pipeline
+        │                          └── llm_classification
         ├── lakebase_setup
         └── tier1_foundation
               └── seed_tier1
                     └── tier2_schemas
                           └── seed_domains
-                                └── (joins with llm_classification
-                                     and substitution_graph)
-                                       └── abstract_views
-                                             ├── metric_views
-                                             ├── delta_sharing
-                                             └── enterprise_agent
-                                                       └── e2e_validation
+                                └── [joins with llm_classification + substitution_graph]
+                                      └── abstract_views
+                                            ├── metric_views
+                                            ├── delta_sharing
+                                            └── enterprise_agent
+                                                  └── e2e_validation
 ```
 
-### Stage 00 — `cleanup` (notebook `00_cleanup.py`)
+| Task | Notebook | Runtime | Description |
+|------|---------|---------|-------------|
+| `cleanup` | `00_cleanup.py` | ~22s | Drop all 4 catalogs (CASCADE) for fresh run |
+| `create_raw_schema` | `01_create_raw_schema.py` | ~38s | Create UC catalogs, schemas, table DDLs; apply UC RLS + PII column tags |
+| `generate_data` | `02_generate_sample_data.py` | ~90s | Synthetic: 10K SKUs, 50K households (incl. Sarah HH00041872), 500K transactions |
+| `tier1_foundation` | `03a_create_tier1_foundation.py` | ~31s | Create frozen Tier 1 tables + version_registry |
+| `seed_tier1` | `03b_seed_tier1_foundation.py` | ~17s | Insert 8 universal classes + 9 relationship types |
+| `tier2_schemas` | `04a_create_tier2_schemas.py` | ~28s | Create all 7 domain schemas + graph/bridge/abstractions/metrics/sharing |
+| `seed_domains` | `04b_seed_all_domains.py` | ~26s | Insert ~92 domain class definitions across 7 domains |
+| `llm_classification` | `05_llm_sku_classification.py` | ~25 min | LLM classify 10K SKUs — Llama 3.3 70B, 20 threads, batches of 10 |
+| `embeddings` | `06_basket2vec_embeddings.py` | ~66s | Train MLlib ALS (rank=128) on basket co-occurrence; write product + household vectors |
+| `vector_search` | `07_vector_search_index.py` | ~10s | Create VS endpoint + delta-sync index (graceful SKIPPED if PyPI blocked) |
+| `substitution_graph` | `08_build_substitution_graph.py` | ~23s | Pairwise cosine similarity; write SUBSTITUTABLE_FOR edges with dietary class filter |
+| `lakebase_setup` | `12_lakebase_setup.py` | ~34s | Agent memory tables + computed bridge tables (household_lifecycle, rx_therapeutic_class, sku_gs1_mapping) |
+| `lakeflow_pipeline` | `11_lakeflow_pipeline.py` | ~7s | Register DLT pipeline config + daily persona refresh job (03:00 UTC) |
+| `abstract_views` | `09_create_abstract_views.py` | ~23s | Create 8 abstract views including kpm_audiences + margin_aware_substitution |
+| `metric_views` | `10_create_metric_views.py` | ~22s | Create 12 metric views (5 new PDF spec KPMs + 7 existing) |
+| `delta_sharing` | `14_delta_sharing.py` | ~19s | Register CPG share with 4 views (kpm_audiences, product_performance, dietary_audiences, substitution_insights) |
+| `enterprise_agent` | `13_enterprise_agent.py` | ~25s | LangGraph StateGraph agent — compile graph, run demo with Sarah (HH00041872) |
+| `e2e_validation` | `15_e2e_validation.py` | ~32s | 18 automated tests across all 5 layers |
 
-Drops all four catalogs (`v2_raw`, `v2_ontology`, `v2_features`, `v2_sharing`) with
-`CASCADE`. Use this to fully reset the platform before a fresh run.
-
-> **When to skip:** If you are running an incremental update and want to preserve existing
-> data, remove `cleanup` from the job DAG or comment out the drop statements.
-
----
-
-### Stage 01 — `create_raw_schema` (notebook `01_create_raw_schema.py`)
-
-Creates all four Unity Catalog catalogs with explicit ADLS Gen2 managed locations,
-then creates every schema and table DDL (transactions, products, customers, inventory,
-pharmacy). Tables are empty shells at this point — data is populated in stage 02.
-
-**Storage location:** `abfss://nsp-test-data@stnsphv9452.dfs.core.windows.net/ontology/`
-
----
-
-### Stage 02 — `generate_data` (notebook `02_generate_sample_data.py`)
-
-Generates fully synthetic retail data at demo scale:
-
-| Dataset | Volume | Notes |
-|---------|--------|-------|
-| SKUs | 10,000 | 20 product profiles with known dietary ground truth |
-| Households | 50,000 | Includes `HH00041872` ("Sarah") — a verified keto shopper |
-| Transactions | 500,000 | 90-day basket history |
-| Stores | 500 | |
-| Inventory snapshots | ~500K | Per node |
-
-The 20 SKU profiles include explicit keto ground truth (Almond Milk ✅, Oat Milk ❌, etc.)
-so the LLM classification can be validated against known answers downstream.
+**Total runtime: ~35–40 minutes** (dominated by `llm_classification` at ~25 min)
 
 ---
 
-### Stage 03a — `tier1_foundation` (notebook `03a_create_tier1_foundation.py`)
+## Deployment Guide
 
-Creates the frozen Tier 1 schema and tables in `v2_ontology.tier1_foundation`:
-
-- `classes_top` — 8 universal classes (Entity, Event, Location, …)
-- `relationship_types` — 9 valid relationship codes (`SUBSTITUTABLE_FOR`, `HAS_INVENTORY`, etc.)
-- `domain_registry` — registry of all 7 tier-2 domains
-- `governance_log` — ARB change log
-
-> **CRITICAL:** This schema is frozen after creation. Any changes require Architecture
-> Review Board sign-off (enforced by governance_log constraints).
-
----
-
-### Stage 03b — `seed_tier1` (notebook `03b_seed_tier1_foundation.py`)
-
-Inserts the 8 top-level class rows and 9 relationship type rows into the Tier 1 tables.
-Runs after `tier1_foundation` creates the empty tables.
-
----
-
-### Stage 04a — `tier2_schemas` (notebook `04a_create_tier2_schemas.py`)
-
-Creates all Tier 2 schemas inside `v2_ontology`:
-
-```
-tier2_product | tier2_customer | tier2_supply_chain | tier2_store_ops
-tier2_pharmacy | tier2_finance | tier2_media
-graph | bridge | abstractions | metrics | sharing
-```
-
-Each domain schema gets a `classes` table (domain taxonomy) and an `entities` table
-(registered entities in the graph).
-
----
-
-### Stage 04b — `seed_domains` (notebook `04b_seed_all_domains.py`)
-
-Inserts ~92 domain class definitions across all 7 domains. Example product domain classes:
-
-```
-/Entity/ProductType
-/Entity/ProductType/FoodProduct
-/Entity/ProductType/FoodProduct/FreshProduct
-/Entity/ProductType/DietaryClass/KetoCompliant   ← keto class registered here
-/Entity/ProductType/DietaryClass/Vegan
-/Entity/ProductType/DietaryClass/GlutenFree
-...
-```
-
----
-
-### Stage 05 — `llm_classification` (notebook `05_llm_sku_classification.py`)
-
-**Runtime: ~25 minutes** — the longest stage.
-
-Classifies all 10,000 SKUs across 4 domains using **Meta Llama 3.3 70B Instruct**
-(Databricks Foundation Model API) with 20 parallel threads and batches of 10.
-
-For each SKU the LLM returns:
-
-```json
-{
-  "dietary": {
-    "is_keto_compliant": true/false,
-    "is_vegan": true/false,
-    "is_gluten_free": true/false,
-    "is_organic": true/false,
-    "is_dairy_free": true/false,
-    "is_paleo": true/false,
-    "is_plant_based": true/false,
-    "is_mediterranean": true/false
-  },
-  "allergens": {
-    "contains_tree_nuts": true/false,
-    "contains_dairy": true/false,
-    "contains_gluten": true/false
-  },
-  "margin": { "margin_segment": "HIGH|MED|LOW" },
-  "pharmacy": {
-    "is_pharmacy_product": true/false,
-    "therapeutic_class": "..."
-  }
-}
-```
-
-Results are written to `v2_ontology.bridge.sku_classifications` with a `confidence_score`
-field. All 10,000 rows use a single endpoint call with no external API keys required —
-the Foundation Model API is built into the workspace.
-
-> **Keto rule enforced in the prompt:** KetoCompliant = TRUE only if net carbs ≤ 5g/serving.
-> Almond milk ✅ (~1g carb), regular oat milk ❌ (~12g carb).
-
----
-
-### Stage 06 — `embeddings` (notebook `06_basket2vec_embeddings.py`)
-
-Trains an **MLlib ALS** (Alternating Least Squares) model on basket co-occurrence to produce
-128-dimensional product and household embeddings.
-
-**How it works:**
-1. Load last 90 days of POS transactions
-2. Build household × UPC implicit feedback matrix (purchase count as signal)
-3. Train ALS with `rank=128`, `alpha=40`, `implicitPrefs=True`
-4. Extract item factors → 128-dim vectors per UPC → `v2_features.product_features.product_embeddings`
-5. Extract user factors → 128-dim vectors per household → `v2_features.household_features.household_embeddings`
-
-Products that are frequently purchased together (e.g. Almond Milk + Avocado + Spinach in a
-keto basket) end up close together in embedding space — this is what drives substitution
-scoring in stage 08.
-
----
-
-### Stage 07 — `vector_search` (notebook `07_vector_search_index.py`)
-
-Attempts to create a Databricks **Vector Search** endpoint and delta-sync index over the
-product embeddings table for sub-millisecond similarity lookups at serving time.
-
-**Graceful degradation:** If the `databricks-vectorsearch` package is unavailable (e.g.
-NSG blocks PyPI in network-restricted environments), the notebook skips VS setup and exits
-successfully. The substitution graph (stage 08) provides the same capability via batch
-cosine similarity and the `sku_online_lookup` table.
-
----
-
-### Stage 08 — `substitution_graph` (notebook `08_build_substitution_graph.py`)
-
-**The core of the platform.** Builds `SUBSTITUTABLE_FOR` relationship edges with dietary
-class preservation.
-
-**Algorithm:**
-1. Sample up to 3,000 products from the embeddings table (O(n²) cross-join)
-2. Self-join and compute pairwise cosine similarity using JVM-native SQL:
-   ```sql
-   aggregate(zip_with(vec_a, vec_b, (x, y) -> x * y), cast(0 as double), (acc, v) -> acc + v)
-   / (sqrt(aggregate(vec_a, ...)) * sqrt(aggregate(vec_b, ...)))
-   ```
-3. Keep pairs with `score > 0.5`
-4. Join with `sku_classifications` — keep pairs where BOTH products share at least one
-   dietary class (KetoCompliant, Vegan, GlutenFree, Organic, DairyFree, Paleo,
-   PlantBased, MediterraneanDiet)
-5. Write edges to `v2_ontology.graph.relationships`
-
-Also builds two serving tables:
-- **`sku_online_lookup`** — SKU master + all dietary/allergen/pharmacy flags, 10K rows
-- **`household_online_lookup`** — household profiles + 90-day transaction stats
-
-**Dietary class preservation ensures:** if Sarah (keto shopper) needs a substitute for
-Almond Milk, she will only be offered products that are also classified as `KetoCompliant`.
-She will never be offered Oat Milk (not keto) as a substitute for Almond Milk (keto).
-
----
-
-### Stage 09 — `abstract_views` (notebook `09_create_abstract_views.py`)
-
-Creates 7 cross-domain SQL views in `v2_ontology.abstractions` for agent and BI consumption:
-
-| View | What it joins | Use case |
-|------|--------------|----------|
-| `unified_inventory` | inventory snapshots + SKU master | Check stock by product |
-| `dietary_sku_catalog` | SKU master + classifications | "Show me all keto products" |
-| `substitutable_products` | graph relationships + SKU master + classifications | "What can replace Almond Milk?" |
-| `household_purchase_history` | transactions + household profiles | Customer 360 |
-| `keto_shopping_list` | dietary catalog filtered to keto + inventory | Keto in-stock basket builder |
-| `out_of_stock_with_substitutes` | inventory + substitution graph | OOS recovery |
-| `pharmacy_cross_sell` | pharmacy RX + dietary + substitution graph | RX-adjacent recommendations |
-
----
-
-### Stage 10 — `metric_views` (notebook `10_create_metric_views.py`)
-
-Creates 4 business metric views in `v2_ontology.metrics` queryable by Genie (natural
-language) or standard SQL:
-
-| View | Metric |
-|------|--------|
-| `daily_sales_performance` | Transaction count, revenue, avg basket value, unique households by day |
-| `inventory_health` | On-hand qty, days-of-supply, below-reorder flag by node+UPC |
-| `dietary_category_sales` | Sales performance broken down by dietary classification |
-| `household_segment_value` | Total spend, trip frequency, loyalty distribution by segment |
-
----
-
-### Stage 11 — `lakeflow_pipeline` (notebook `11_lakeflow_pipeline.py`)
-
-Registers a **Lakeflow (DLT) pipeline** configuration for incremental streaming ingestion:
-- Bronze tables: raw POS transactions and inventory snapshots streamed from `v2_raw`
-- Silver tables: deduplicated, cleaned versions
-- Configuration: Photon enabled, CDF enabled, triggered (not continuous)
-
-The pipeline definition is created/updated via Databricks SDK. If the SDK call is unavailable,
-the notebook prints the JSON config for manual creation.
-
----
-
-### Stage 12 — `lakebase_setup` (notebook `12_lakebase_setup.py`)
-
-Sets up persistent **agent memory tables** for the enterprise agent (stage 13).
-
-Tries **Lakebase** (Postgres-compatible managed database) first. If unavailable, creates
-equivalent Delta tables in `v2_ontology.graph`:
-
-| Table | Purpose |
-|-------|---------|
-| `agent_sessions` | Conversation session tracking |
-| `agent_memory` | Key-value persistent memory per household |
-| `agent_tool_calls` | Audit log of all tool calls made by the agent |
-
----
-
-### Stage 13 — `enterprise_agent` (notebook `13_enterprise_agent.py`)
-
-An **AI Shopping Assistant** powered by Llama 3.3 70B that queries the ontology views
-as tools.
-
-**System prompt:** "For Keto customers: only suggest products where `is_keto=TRUE`. When a
-product is OOS: use substitutions that preserve dietary classes."
-
-**Tool functions exposed to the LLM:**
-- `query_dietary_catalog(dietary_flag)` — find products by dietary classification
-- `find_substitutes(upc)` — look up substitution graph edges for a given SKU
-- `check_inventory(upc, store_id)` — query unified_inventory view
-- `get_household_profile(household_id)` — load household dietary preferences and purchase history
-
-**Demo conversation run:** The notebook executes a live conversation as household `HH00041872`
-(Sarah, verified keto shopper) asking for a weekly keto meal plan, showing the agent using
-each tool and preserving keto compliance throughout.
-
----
-
-### Stage 14 — `delta_sharing` (notebook `14_delta_sharing.py`)
-
-Sets up **Delta Sharing** with three aggregated views for CPG partners — no PII exposed:
-
-| Sharing View | Data | PII? |
-|-------------|------|------|
-| `cpg_product_performance` | Units sold, revenue, price by brand/category/dept | None |
-| `dietary_trend_analysis` | Dietary classification adoption trends over time | None |
-| `substitution_patterns` | Which products substitute for which, how often | None |
-
-A share `ontology-cpg-partner-share` and recipient `cpg-partner-demo` are registered in
-Unity Catalog.
-
----
-
-### Stage 15 — `e2e_validation` (notebook `15_e2e_validation.py`)
-
-Runs **18 automated tests** across 9 phases to confirm the full pipeline is healthy:
-
-| Phase | Tests | What is validated |
-|-------|-------|------------------|
-| 1 | Raw data | 10K SKUs, 50K households, 500K transactions present |
-| 2 | Ontology structure | Tier 1 classes and relationship types seeded correctly |
-| 3 | LLM classification | `sku_classifications` has 10K rows, keto products classified |
-| 4 | Embeddings | 10K product vectors present, 128 dimensions, no nulls |
-| 5 | Substitution graph | `SUBSTITUTABLE_FOR` edges exist; keto substitutes preserve keto flag |
-| 6 | Abstract views | All 7 abstraction views return rows |
-| 7 | Agent memory | `agent_sessions` and `agent_memory` tables exist |
-| 8 | Metric views | All 4 metric views return rows |
-| 9 | Serving tables | `sku_online_lookup` has 10K rows, `household_online_lookup` populated |
-
-All 18 tests must PASS for the pipeline to be considered complete.
-
----
-
-## The Keto Use Case End-to-End
-
-This section traces a single real-world scenario — *Sarah wants a keto-safe substitute for
-Almond Milk when it is out of stock* — through every layer of the platform.
-
-### Step 1 — Ground Truth in Raw Data (Stage 02)
-
-When synthetic data is generated, Almond Milk SKUs are created with the profile:
-```python
-("Almond Milk", {"keto": True, "vegan": True, "gf": True, "dairy_free": True}, "07", "KETO|VEGAN|GF|DAIRY_FREE")
-```
-Oat Milk is explicitly `keto: False`. This ground truth flows into `v2_raw.products.sku_master`
-via the `certifications` column.
-
-Household `HH00041872` ("Sarah") is seeded with a basket history that skews heavily toward
-keto products (Almond Milk, Avocado, Chicken Breast, Spinach, etc.).
-
-### Step 2 — LLM Classification (Stage 05)
-
-The LLM receives Almond Milk's product card:
-```
-Product Name: Almond Milk Unsweetened
-Certifications on pack: KETO|VEGAN|GF|DAIRY_FREE
-KETO RULE: almond milk YES — ~1g carb
-```
-It returns `is_keto_compliant: true`, which is written to `v2_ontology.bridge.sku_classifications`.
-
-Coconut Milk, Heavy Cream, and other keto staples are similarly classified `true`. Oat Milk,
-White Rice, and Pasta are classified `false`.
-
-### Step 3 — Basket2Vec Embedding (Stage 06)
-
-ALS learns that Almond Milk, Avocado, Spinach, Chicken Breast, and Bacon co-occur in keto
-shopping baskets. Their 128-dim embedding vectors end up geometrically close. Oat Milk lives
-in a different region of the embedding space (it co-occurs with Granola Bars, Yogurt, Pasta).
-
-### Step 4 — Substitution Graph (Stage 08)
-
-The self-join finds:
-- `cosine_sim(Almond Milk, Coconut Milk) > 0.5` ← both appear in keto baskets
-- Both have `is_keto_compliant = true` in `sku_classifications`
-- `shared_class_ids = ["KetoCompliant", "Vegan", "GlutenFree", "DairyFree"]`
-
-This edge is written to `v2_ontology.graph.relationships`:
-```
-SUBSTITUTABLE_FOR: Almond Milk → Coconut Milk
-  weight: 0.73  shared_class_ids: [KetoCompliant, Vegan, GlutenFree, DairyFree]
-```
-
-Oat Milk does NOT appear as a substitute for Almond Milk — it would fail the
-`shared_class_ids` filter because Oat Milk is `is_keto_compliant = false`.
-
-### Step 5 — Abstract Views (Stage 09)
-
-The `out_of_stock_with_substitutes` view joins the substitution graph with inventory:
-```sql
-SELECT original_product, substitute_product, shared_class_ids, available_qty
-FROM v2_ontology.abstractions.out_of_stock_with_substitutes
-WHERE original_upc = '<almond_milk_upc>'
-  AND array_contains(shared_class_ids, 'KetoCompliant')
-ORDER BY weight DESC
-```
-Result: Coconut Milk (in stock, keto ✅), Heavy Cream (in stock, keto ✅).
-
-### Step 6 — Enterprise Agent (Stage 13)
-
-Sarah asks: *"I need Almond Milk but it's out of stock at my store."*
-
-The agent:
-1. Calls `get_household_profile("HH00041872")` → `is_keto = true`
-2. Calls `check_inventory("<almond_milk_upc>", "STORE_042")` → OOS
-3. Calls `find_substitutes("<almond_milk_upc>")` → Coconut Milk (score 0.73, keto ✅),
-   Heavy Cream (score 0.61, keto ✅)
-4. Calls `check_inventory("<coconut_milk_upc>", "STORE_042")` → 24 units available
-
-Response: *"Almond Milk is currently out of stock at your store. I found two keto-safe
-alternatives: Coconut Milk ($3.49, 24 units in stock) and Heavy Cream ($2.99, 18 units
-in stock). Both preserve your keto dietary requirements."*
-
-### Step 7 — Validation (Stage 15)
-
-Test T15 (Phase 5 — Substitution Graph) explicitly checks:
-```python
-keto_subs = spark.sql("""
-    SELECT r.source_entity_id, r.target_entity_id, r.shared_class_ids
-    FROM v2_ontology.graph.relationships r
-    WHERE r.rel_type = 'SUBSTITUTABLE_FOR'
-      AND array_contains(r.shared_class_ids, 'KetoCompliant')
-""")
-assert keto_subs.count() > 0, "No keto substitution edges found"
-```
-This asserts that the Almond Milk → Coconut Milk edge (and others like it) exist.
-
----
-
-## Deployment Prerequisites
+### Prerequisites
 
 | Requirement | Details |
 |-------------|---------|
 | **Databricks workspace** | Azure Databricks with Unity Catalog enabled |
-| **Storage** | ADLS Gen2 container accessible as managed location for UC catalogs |
-| **Cluster** | DBR 17.3 LTS ML, `SINGLE_USER` access mode (required for MLlib ALS + UC) |
-| **Foundation Model API** | `databricks-meta-llama-3-3-70b-instruct` endpoint enabled in the workspace |
-| **Permissions** | User must have `CREATE CATALOG` and `CREATE EXTERNAL LOCATION` privileges |
-| **Network** | Outbound internet access is NOT required (all Databricks APIs are internal) |
+| **Storage** | ADLS Gen2 container as UC managed external location |
+| **Cluster** | DBR 17.3 LTS ML · `SINGLE_USER` mode · `Standard_D16s_v3` · autoscale 2–8 |
+| **Foundation Model API** | `databricks-meta-llama-3-3-70b-instruct` endpoint enabled |
+| **Permissions** | `CREATE CATALOG`, `CREATE EXTERNAL LOCATION` |
+| **Network** | Outbound internet NOT required (all Databricks APIs internal) |
+| **LangGraph** | `langgraph>=0.2` installed via `%pip install` in notebook 13 |
 
-> **Note:** Vector Search (stage 07) requires PyPI access to install `databricks-vectorsearch`.
-> In network-restricted environments the notebook gracefully skips VS setup. All other stages
-> work fully offline.
+> Vector Search (stage 07) needs PyPI access for `databricks-vectorsearch`. In NSG-restricted environments, the notebook exits gracefully with SKIPPED — all other 17 tasks work fully offline.
 
----
-
-## How to Deploy
-
-### 1 — Clone the repository
+### 1 — Clone and configure storage
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/sumitprakash-forge/retail_ontology_platform
 cd ontology-platform
 ```
 
-### 2 — Configure the storage location
-
-Edit `01_create_raw_schema.py` line 17 to point at your ADLS container:
-
+Edit `01_create_raw_schema.py` line ~17:
 ```python
 BASE = "abfss://<container>@<storage-account>.dfs.core.windows.net/ontology"
 ```
 
-### 3 — Create the all-purpose cluster
-
-Via Databricks UI or CLI:
+### 2 — Create the cluster
 
 ```bash
 databricks clusters create --profile <your-profile> --json '{
   "cluster_name": "ontology-platform-cluster",
-  "spark_version": "17.3.x-scala2.12",
+  "spark_version": "17.3.x-ml-scala2.12",
   "node_type_id": "Standard_D16s_v3",
   "autoscale": {"min_workers": 2, "max_workers": 8},
   "data_security_mode": "SINGLE_USER",
@@ -562,10 +602,7 @@ databricks clusters create --profile <your-profile> --json '{
 }'
 ```
 
-> Use `17.3.x-ml-scala2.12` (ML runtime) to get MLlib ALS and pre-installed Databricks
-> libraries without needing PyPI access.
-
-### 4 — Upload notebooks to workspace
+### 3 — Upload notebooks
 
 ```bash
 for nb in notebooks/*.py; do
@@ -579,169 +616,124 @@ for nb in notebooks/*.py; do
 done
 ```
 
-### 5 — Create the Databricks Job
+### 4 — Create and run the job
 
 ```bash
 databricks jobs create --profile <your-profile> --json @deploy/job_definition.json
+databricks jobs run-now --job-id <job-id> --profile <your-profile>
 ```
 
-The job definition file (`deploy/job_definition.json`) defines the full task DAG, cluster
-binding, and notebook paths. The key fields per task:
-
-```json
-{
-  "task_key": "substitution_graph",
-  "notebook_task": {
-    "notebook_path": "/Users/<email>/ontology-platform/08_build_substitution_graph",
-    "source": "WORKSPACE"
-  },
-  "existing_cluster_id": "<cluster-id>",
-  "depends_on": [{"task_key": "embeddings"}]
-}
-```
-
----
-
-## How to Run the Pipeline
-
-### Full run (fresh environment)
+### 5 — Monitor progress
 
 ```bash
-databricks jobs run-now \
-  --job-id <job-id> \
-  --profile <your-profile>
-```
-
-This runs all 18 tasks in DAG order from `cleanup` through `e2e_validation`.
-Expected total runtime: **~35–40 minutes** (dominated by `llm_classification` at ~25 min).
-
-### Monitor progress
-
-```bash
-# Get latest run ID
-databricks jobs list-runs --job-id <job-id> --profile <your-profile>
-
-# Watch task states
+# Watch task states in real time
 watch -n 30 'databricks jobs get-run <run-id> --profile <your-profile> | \
   python3 -c "
-import sys,json
-d=json.load(sys.stdin)
-tasks=d.get(\"tasks\",[])
-latest={}
+import sys, json
+d = json.load(sys.stdin)
+tasks = d.get(\"tasks\", [])
+latest = {}
 for t in tasks:
-    tk=t[\"task_key\"]; a=t.get(\"attempt_number\",0)
-    if tk not in latest or a>latest[tk][1]: latest[tk]=(t,a)
-[print(f\"  {tk}: {t.get(chr(115)+chr(116)+chr(97)+chr(116)+chr(101),{}).get(chr(114)+chr(101)+chr(115)+chr(117)+chr(108)+chr(116)+chr(95)+chr(115)+chr(116)+chr(97)+chr(116)+chr(101),chr(63))}\") for tk,(t,_) in sorted(latest.items())]
+    tk = t[\"task_key\"]; a = t.get(\"attempt_number\", 0)
+    if tk not in latest or a > latest[tk][1]: latest[tk] = (t, a)
+[print(f\"  [{tk}]: {t.get(\"state\",{}).get(\"result_state\",\"?\")}\") for tk,(t,_) in sorted(latest.items())]
 "'
 ```
 
-### Incremental run (skip data generation)
-
-If raw data already exists, you can trigger only the ML and graph stages by running
-`repair-run` and specifying only the tasks you want to re-execute:
-
-```bash
-# Get latest repair ID from the run
-REPAIR_ID=$(databricks jobs get-run <run-id> --profile <your-profile> | \
-  python3 -c "import sys,json; d=json.load(sys.stdin); rh=d.get('repair_history',[]); print(rh[-1]['repair_id'] if rh else 0)")
-
-databricks jobs repair-run <run-id> \
-  --latest-repair-id $REPAIR_ID \
-  --rerun-tasks "llm_classification,embeddings,substitution_graph,vector_search,abstract_views,metric_views,enterprise_agent,delta_sharing,e2e_validation" \
-  --profile <your-profile>
-```
-
----
-
-## Rerunning Failed Tasks
-
-If specific tasks fail, use the repair API to rerun only failed tasks without repeating
-successful ones. The `latest_repair_id` is required for subsequent repairs (the first
-repair omits it).
+### Rerunning Failed Tasks
 
 ```bash
 TOKEN=$(databricks auth token --host <workspace-url> --profile <profile> | \
   python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
 
-# First repair (no latest_repair_id needed)
-curl -s -X POST "<workspace-url>/api/2.1/jobs/runs/repair" \
+# First repair
+curl -X POST "<workspace-url>/api/2.1/jobs/runs/repair" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{
-    "run_id": <run-id>,
-    "rerun_all_failed_tasks": true
-  }'
+  -d '{"run_id": <run-id>, "rerun_all_failed_tasks": true}'
 
-# Subsequent repairs (supply the repair_id returned by the previous call)
-curl -s -X POST "<workspace-url>/api/2.1/jobs/runs/repair" \
+# Subsequent repair (supply repair_id from previous response)
+curl -X POST "<workspace-url>/api/2.1/jobs/runs/repair" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{
-    "run_id": <run-id>,
-    "latest_repair_id": <previous-repair-id>,
-    "rerun_all_failed_tasks": true
-  }'
+  -d '{"run_id": <run-id>, "latest_repair_id": <prev-repair-id>, "rerun_all_failed_tasks": true}'
 ```
 
-**Common failures and fixes:**
+**Common issues:**
 
 | Symptom | Root Cause | Fix |
 |---------|-----------|-----|
-| Task fails in ~22s | Cluster was TERMINATED when repair started | Start cluster first, wait for RUNNING, then repair |
-| `WRONG_COLUMN_DEFAULTS_FOR_DELTA_FEATURE_NOT_ENABLED` | CTAS inherits DEFAULT constraints from `v2_raw` source tables | Use `CREATE TABLE ... USING DELTA` + `insertInto()` — never CTAS from `v2_raw` |
-| `llm_classification` returns 0 keto rows | `confidence_score` filter too strict (LLM sets 0.0) | Remove confidence threshold; use all classified rows |
-| `substitution_graph` finds 0 pairs | Cosine similarity threshold too high for ALS vectors | Use threshold `> 0.5` (ALS factors have lower cosine range than text embeddings) |
-| `vector_search` fails at ~399s | pip install hangs waiting for PyPI (NSG blocks outbound) | Notebook now exits SUCCESS gracefully when VS client unavailable |
+| Task fails in ~22s | Cluster TERMINATED when repair started | Start cluster, wait for RUNNING, then repair |
+| `WRONG_COLUMN_DEFAULTS_FOR_DELTA_FEATURE_NOT_ENABLED` | CTAS from `v2_raw` inherits DEFAULT constraints | Use `CREATE TABLE ... USING DELTA` + `insertInto()` |
+| `llm_classification` 0 keto rows | `confidence_score` filter too strict | Remove confidence threshold — use all classified rows |
+| `substitution_graph` 0 pairs | Cosine threshold too high for ALS factors | Use threshold `> 0.5` (ALS range is lower than Word2Vec) |
+| `vector_search` fails instantly | pip install hanging (PyPI blocked) | Notebook now exits SKIPPED gracefully |
 
 ---
 
 ## Catalog & Schema Reference
 
 ```
-v2_raw
-├── transactions.pos_transactions        — 500K POS rows
-├── products.sku_master                  — 10K SKU catalog
-├── customers.household_profiles         — 50K households
-├── inventory.node_inventory_snapshots   — inventory by node
-└── pharmacy.rx_claims                   — pharmacy data
+v2_raw                                      ← LAYER 1: Facts
+├── transactions.pos_transactions           500K POS rows, CDC enabled, partitioned by date
+├── products.sku_master                     10K SKU catalog
+├── customers.household_profiles            50K households, UC RLS + PII column tags
+├── inventory.node_inventory_snapshots      ~500K inventory by node, partitioned by date
+└── pharmacy.rx_claims                      Pharmacy prescription data
 
-v2_ontology
-├── tier1_foundation
-│   ├── classes_top                      — 8 universal classes (FROZEN)
-│   ├── relationship_types               — 9 valid rel codes (FROZEN)
-│   ├── domain_registry                  — 7 domain registrations
-│   └── governance_log                   — ARB change log
-├── tier2_product / tier2_customer / ...
-│   ├── classes                          — domain taxonomy (~92 total)
-│   └── entities                         — registered graph entities
+v2_ontology                                 ← LAYER 2 + LAYER 3
+├── tier1_foundation (FROZEN)
+│   ├── classes_top                         8 universal classes
+│   ├── relationship_types                  9 valid relationship codes
+│   ├── domain_registry                     7 domain registrations
+│   ├── governance_log                      ARB change log
+│   └── version_registry                    Schema versioning
+├── tier2_product / tier2_customer / tier2_supply_chain
+│   tier2_pharmacy / tier2_finance / tier2_media / tier2_store_ops
+│   ├── classes                             Domain taxonomy (~92 total)
+│   └── entities                            Registered graph entities
 ├── bridge
-│   └── sku_classifications              — LLM flags per SKU (10K rows)
+│   ├── sku_classifications                 LLM dietary/allergen/margin/pharmacy flags (10K)
+│   ├── household_lifecycle                 Lifecycle stage per household (90d trips)
+│   ├── rx_therapeutic_class                Therapeutic class per Rx
+│   └── sku_gs1_mapping                     GS1 dept/category/brick codes
 ├── graph
-│   ├── relationships                    — semantic edges (SUBSTITUTABLE_FOR etc.)
-│   ├── sku_online_lookup                — serving table: SKU + all flags
-│   └── household_online_lookup          — serving table: HH + 90d stats
+│   ├── relationships                       SUBSTITUTABLE_FOR edges with shared_class_ids
+│   ├── sku_online_lookup                   Agent serving: SKU + all flags (10K)
+│   ├── household_online_lookup             Agent serving: HH + 90d stats
+│   ├── agent_sessions                      LangGraph session tracking
+│   ├── agent_memory                        Persistent HH memory (key-value)
+│   └── agent_tool_calls                    Tool call audit log
 ├── abstractions
-│   ├── unified_inventory
-│   ├── dietary_sku_catalog
-│   ├── substitutable_products
-│   ├── household_purchase_history
-│   ├── keto_shopping_list
-│   ├── out_of_stock_with_substitutes
-│   └── pharmacy_cross_sell
-├── metrics
-│   ├── daily_sales_performance
-│   ├── inventory_health
-│   ├── dietary_category_sales
-│   └── household_segment_value
-└── sharing
-    ├── cpg_product_performance
-    ├── dietary_trend_analysis
-    └── substitution_patterns
+│   ├── dietary_sku_catalog                 Keto/dietary product filtered catalog
+│   ├── substitution_graph                  SUBSTITUTABLE_FOR with dietary preservation
+│   ├── kpm_audiences                       Persona segments (KetoDieter: share > 0.35)
+│   ├── unified_inventory                   Stock by product + node
+│   ├── pharmacy_crosssell                  RX-adjacent dietary recommendations
+│   ├── atrisk_customer_radar               Churn risk (trip frequency drop, 30d vs prior)
+│   ├── margin_aware_substitution           composite_score = fit × margin × similarity
+│   └── retail_media_audiences             Targeting segments for Retail Media Network
+└── metrics
+    ├── keto_households                     KetoDieter household count (basket_share > 0.35)
+    ├── net_revenue                         Gross sales minus returns/markdowns
+    ├── digital_penetration                 % digital/app channel transactions
+    ├── avg_basket_size                     Avg items + spend per trip by loyalty tier
+    ├── at_risk_value                       Revenue at risk from HIGH churn households
+    ├── daily_sales_performance             Transaction count, revenue, avg basket by day
+    ├── inventory_health                    On-hand, days-of-supply, below-reorder flag
+    ├── dietary_category_sales              Sales by dietary classification
+    ├── household_segment_value             Spend, frequency by loyalty segment
+    ├── substitution_conversion             OOS substitution acceptance rate
+    ├── keto_compliance_rate                % keto substitutions that are truly keto
+    └── pharmacy_crosssell_rate             Pharmacy cross-sell attachment rate
 
-v2_features
-├── product_features.product_embeddings  — 128-dim ALS vectors per UPC
-└── household_features.household_embeddings — 128-dim ALS vectors per HH
+v2_features                                 ← LAYER 4: Embeddings
+├── product_features.product_embeddings     128-dim ALS vectors per UPC (10K rows)
+└── household_features.household_embeddings 128-dim ALS vectors per household (50K rows)
 
-v2_sharing
-└── (Delta Sharing recipient views — mirrors v2_ontology.sharing)
+v2_sharing                                  ← LAYER 5: Delta Sharing
+├── cpg_product_performance                 Units, revenue, price by brand/category (no PII)
+├── cpg_dietary_audiences                   Persona counts by dietary segment (no PII)
+├── cpg_substitution_insights               Substitution frequency by product pair (no PII)
+└── kpm_audiences                           KetoDieter persona counts only (no HH IDs)
 ```
