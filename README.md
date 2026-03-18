@@ -21,45 +21,70 @@ An enterprise-grade, 5-layer retail intelligence platform built on Databricks La
 
 ## Architecture Overview
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  LAYER 5 — CONSUMPTION                                                      │
-│  AI Shopping Assistant │ Genie NL2SQL │ Retail Media Network │ Delta Sharing│
-└───────────────────────────────────┬─────────────────────────────────────────┘
-                                    │
-┌───────────────────────────────────▼─────────────────────────────────────────┐
-│  LAYER 4 — AGENT & REASONING                                                │
-│  LangGraph StateGraph (8 nodes) · Llama 3.3 70B (Foundation Model API)     │
-│  Domain Router · MLflow Tracing · Lakebase Agent Memory                    │
-│  Lakeflow DLT Pipeline (bronze/silver/gold + daily persona refresh)         │
-│  Vector Search Index (graceful skip if PyPI blocked)                        │
-└───────────────────────────────────┬─────────────────────────────────────────┘
-                                    │
-┌───────────────────────────────────▼─────────────────────────────────────────┐
-│  LAYER 3 — SEMANTIC VIEWS                                                   │
-│  8 Abstract Views (dietary_sku_catalog, substitution_graph, kpm_audiences,  │
-│    unified_inventory, pharmacy_crosssell, atrisk_customer_radar,            │
-│    margin_aware_substitution, retail_media_audiences)                       │
-│  12 Metric Views (keto_households, net_revenue, digital_penetration,        │
-│    avg_basket_size, at_risk_value + 7 existing KPIs)                        │
-└───────────────────────────────────┬─────────────────────────────────────────┘
-                                    │
-┌───────────────────────────────────▼─────────────────────────────────────────┐
-│  LAYER 2 — ONTOLOGY                                                         │
-│  Tier 1: 8 Universal Frozen Classes + version_registry (ARB-governed)       │
-│  Tier 2: 7 Domain Schemas (product, customer, supply_chain,                 │
-│          pharmacy, finance, media) · ~92 classes                            │
-│  Bridge Tables: sku_classifications (LLM) · household_lifecycle ·           │
-│          rx_therapeutic_class · sku_gs1_mapping                             │
-│  Graph: relationships (SUBSTITUTABLE_FOR edges)                             │
-└───────────────────────────────────┬─────────────────────────────────────────┘
-                                    │
-┌───────────────────────────────────▼─────────────────────────────────────────┐
-│  LAYER 1 — FACTS (RAW DATA)                                                 │
-│  Delta Lake: pos_transactions · sku_master · household_profiles ·           │
-│  node_inventory_snapshots · rx_claims                                       │
-│  CDC enabled · Partitioned · UC Row-Level Security · Column Tags (PII)      │
-└─────────────────────────────────────────────────────────────────────────────┘
+> **Databricks Lakehouse · Unity Catalog Governed · Diagram 1 of 2** — See [Keto End-to-End Flow](#keto-end-to-end-flow-diagram-2) for Diagram 2.
+>
+> Tier 1 (Universal) → Tier 2 (7 Domains) → Tier 3 (Application Views)
+
+```mermaid
+graph TB
+    %% ── LAYER 5 — CONSUMPTION ─────────────────────────────────────────────
+    subgraph L5["　　　　　LAYER 5 — CONSUMPTION　|　Who Queries the Ontology　　　　　"]
+        direction LR
+        C1["🤖 **AI Shopping**\n**Assistant**\nCustomer-facing app\nPersonalised queries\nAgent framework\nGenie NL2SQL"]
+        C2["📊 **Data Science**\n**& Analytics**\nReal-time audience\ninsights · Campaigns\nDashboards\nGenie"]
+        C3["📡 **Retail Media**\n**Network**\nCPG partner\ntargeting\nAudience reporting\nDelta Sharing"]
+        C4["💊 **Pharmacy**\n**& Health**\nRx cross-sell signals\nRefill abandonment\nMulti-channel\nalerts"]
+    end
+
+    %% ── LAYER 4 — AGENT & REASONING ──────────────────────────────────────
+    subgraph L4["　　LAYER 4 — AGENT & REASONING　|　LANGRAPH · MLFLOW TRACING · DOMAIN ROUTER　　"]
+        direction LR
+        DR["🧭 **Domain**\n**Router**\nRoutes intent\nto tool domains\nstate.domains\nconditional exec"]
+        OT["🔧 **Ontology**\n**Tools** ×6\nquery_dietary\nfind_substitutes\ncheck_inventory\nget_kpm · pharmacy"]
+        LF["🔄 **Lakeflow DLT**\nBronze→Silver→Gold\ngold_oos_alerts\nPersona refresh\n03:00 UTC daily"]
+        LLM["🧠 **LLM + Embeddings**\nLlama 3.3 70B\nFoundation Model API\nMLlib ALS 128-dim\nMLflow tracing"]
+        VS["🔍 **Vector Search**\n128-dim ALS index\nDelta-sync endpoint\nGraceful skip\nif PyPI blocked"]
+        LB["🗄️ **Lakebase**\n**Agent Memory**\nagent_sessions\nagent_memory\nagent_tool_calls\nPersistent HH context"]
+    end
+
+    %% ── LAYER 3 — SEMANTIC VIEWS ──────────────────────────────────────────
+    subgraph L3["　　　　LAYER 3 — SEMANTIC VIEWS　|　8 Abstract Views · Never Touch Raw Tables　　　　"]
+        direction LR
+        AV1["🥗 **dietary_sku_catalog**\nFiltered product catalog\nby dietary class"]
+        AV2["🔀 **substitution_graph**\nSUBSTITUTABLE_FOR\n+ dietary preservation"]
+        AV3["🎯 **kpm_audiences**\nKetoDieter persona\nbasket_share > 0.35"]
+        AV4["📦 **unified_inventory**\nStock by product\n+ store node"]
+        AV5["💊 **pharmacy_crosssell**\nRx-adjacent\ndietary recs"]
+        AV6["⚠️ **atrisk_customer_radar**\nTrip-frequency drop\n30d vs prior 30d"]
+        AV7["💰 **margin_aware_sub**\nfit × margin\n× similarity score"]
+        AV8["📡 **retail_media_audiences**\nKPM segments for\nadvertiser targeting"]
+        MV["📈 **12 Metric Views** — Genie-ready NL2SQL\nketo_households · net_revenue · digital_penetration\navg_basket_size · at_risk_value · daily_sales · inventory_health · +5"]
+    end
+
+    %% ── LAYER 2 — ONTOLOGY ────────────────────────────────────────────────
+    subgraph L2["　　　LAYER 2 — ONTOLOGY　|　Three-Tier Metadata · Delta Change Data Feed　　　"]
+        direction LR
+        T1["🔒 **Tier 1**\n**Universal Foundation**\n8 frozen classes\nversion_registry\nARB-governed\nCHANGES REQUIRE REVIEW"]
+        T2["🏗️ **Tier 2**\n**7 Domain Schemas**\n~92 classes\nproduct · customer\npharmacy · finance\nmedia · supply chain"]
+        BR["🌉 **Bridge Tables**\nsku_classifications\n← LLM classifies meaning\nhousehold_lifecycle\nrx_therapeutic_class\nsku_gs1_mapping"]
+        GR["🕸️ **Graph**\nrelationships\nSUBSTITUTABLE_FOR\ncosine sim > 0.5\nshared_class_ids\ndiet-class preserved"]
+    end
+
+    %% ── LAYER 1 — FACTS ──────────────────────────────────────────────────
+    subgraph L1["　　LAYER 1 — FACTS　|　v2_raw · Delta Lake · CDC enabled · UC RLS · PII column-tagged　　"]
+        direction LR
+        F1["📋 **Transactions**\npos_transactions\n500K rows\nPartitioned by date\nCDC enabled"]
+        F2["📦 **SKU Master**\nsku_master\n10K products\n→ LLM classifies\nmeaning"]
+        F3["👥 **Household**\n**Profiles**\n50K households\nPII column-tagged\nUnity Catalog RLS"]
+        F4["🏪 **Inventory**\nnode_inventory\n~500K snapshots\nStore · DC · 3P\nnodes · CDF streaming"]
+        F5["💊 **Pharmacy Rx**\nrx_claims\nPrescriptions\nRefill · abandonment\nDelta Lake"]
+    end
+
+    %% ── FLOW ──────────────────────────────────────────────────────────────
+    L1 -->|"CDC / Delta Change Feed"| L2
+    L2 -->|"Generated abstract views\n— never touch raw tables"| L3
+    L3 -->|"Tools exposed to agent"| L4
+    L4 -->|"Answers / audiences / sharing"| L5
 ```
 
 **Unity Catalog layout:**
@@ -413,7 +438,67 @@ Share: `ontology-cpg-partner-share` | Recipient: `cpg-partner-demo`
 
 ## Keto End-to-End Flow (Diagram 2)
 
-This section traces **Sarah (HH00041872)**, a verified KetoDieter, through all 5 layers when Almond Milk is out of stock.
+> **How the ontology turns a customer's purchase history into a personalised, OOS-safe meal plan** — Diagram 2 of 2
+
+### Sarah — Loyalty Customer · HH00041872
+
+| keto_basket_share | Spend (last 90d) | Shopping Trips | Assigned Persona |
+|:-----------------:|:----------------:|:--------------:|:----------------:|
+| **0.41** | **$312** | **18** | **KetoDieter** |
+
+```mermaid
+flowchart TD
+    Sarah(["👤 Sarah · HH00041872\nActive shopper · Primary store STORE_042\n90-day purchase window analysed"])
+
+    subgraph S1["① LAYER 1 — FACTS  (L1)"]
+        direction LR
+        L1a["📋 Purchase history ingested\n90 days of transactions\npos_transactions · CDC enabled"]
+        L1b["📦 SKU attributes stored\nUPC · brand · dept · category\ncertifications · price"]
+    end
+
+    subgraph S2["② LAYER 2 — LLM CLASSIFICATION  (L2 · Bridge)"]
+        direction LR
+        L2a["🧠 LLM classifies every SKU\nAlmond Milk → is_keto_compliant = TRUE\nOat Milk → is_keto_compliant = FALSE\n(net carbs: ~1g vs ~12g)"]
+        L2b["🗂️ Written to bridge.sku_classifications\nDietary · Allergen · Margin · Pharmacy\nper SKU · confidence scored"]
+    end
+
+    subgraph S3["③ LAYER 2 — GRAPH  (L2 · Substitution Graph)"]
+        direction LR
+        L3a["🕸️ ALS 128-dim basket embeddings\nAlmond Milk + Coconut Milk\nco-occur in keto baskets\ncosine_sim = 0.89  > 0.50 ✅"]
+        L3b["✅ SUBSTITUTABLE_FOR edge created\nAlmond Milk → Coconut Milk\nshared_class_ids = [KetoCompliant, Vegan\nDairyFree, GlutenFree]\n❌ Oat Milk: sim=0.21, not keto → NO edge"]
+    end
+
+    subgraph S4["④ LAYER 2→3 — PERSONA INFERENCE  (L3 · kpm_audiences)"]
+        L4a["🎯 keto_basket_share = 0.41\n0.41 > 0.35 threshold\nlifecycle_stage = ACTIVE\npersona = KetoDieter ✅"]
+    end
+
+    subgraph S5["⑤ LAYER 4 — AGENT REQUEST  (LangGraph)"]
+        direction LR
+        L5a["💬 Sarah asks:\n'Build me a 5-day keto meal plan.\nI need Almond Milk but it's OOS.'"]
+        L5b["🧭 Domain Router\ndomains = [dietary, substitution,\ninventory, kpm]\nLangGraph: 8-node StateGraph\nMLflow trace recorded"]
+    end
+
+    subgraph S6["⑥ LAYER 3 — OOS RESOLUTION  (L3 · margin_aware_substitution)"]
+        direction LR
+        L6a["❌ Almond Milk at STORE_042\nunified_inventory: qty = 0  OOS"]
+        L6b["✅ Coconut Milk at STORE_042\nqty = 24  In Stock\ncomposite_score = 0.95 × 1.2 × 0.89\n= 1.014  ← top substitute"]
+    end
+
+    subgraph S7["⑦ LAYER 5 — DOWNSTREAM VALUE  (L5 · Consumption)"]
+        direction LR
+        V1["🤖 AI Shopping Assistant\nSarah receives keto-safe\nmeal plan + substitute\n'Coconut Milk · $3.49 · 24 in stock'"]
+        V2["📡 Delta Sharing\nCPG partner sees OOS event\n+ substitution in\ncpg_substitution_insights"]
+        V3["📊 Genie / Analytics\nketo_households metric\nupdated · at_risk_value\nrecalculated"]
+    end
+
+    Sarah --> S1
+    S1 --> S2
+    S2 --> S3
+    S3 --> S4
+    S4 --> S5
+    S5 --> S6
+    S6 --> S7
+```
 
 ### Step 1 — L1: Facts Established
 
